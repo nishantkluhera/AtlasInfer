@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 # AtlasInfer
 
 Under Construction
@@ -199,3 +200,5 @@ AtlasInfer modifies the standard transformer inference pipeline:
         *   If offloading, the hook moves weights/bias back to CPU (`post_forward`) and clears the dequantization cache.
     *   **LM Head:** Final prediction computation (hooked if offloading and quantized).
     *   Logits are processed (sampling/greedy) to get the next token.
+=======
+>>>>>>> Stashed changes
