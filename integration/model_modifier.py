@@ -62,17 +62,44 @@ def _get_model_patterns(model_type: str) -> Optional[Dict]:
     return patterns
 
 def _replace_module(parent_module: nn.Module, child_name: str, new_module: nn.Module):
-    """Safely replaces a submodule, deleting the old one."""
+    """
+    Safely replaces a submodule, attempting to aggressively clean up the old one
+    to potentially prevent recursion errors during .to() or state_dict loading.
+    """
     old_module = getattr(parent_module, child_name, None)
+    # Set the new module first
     setattr(parent_module, child_name, new_module)
-    # Try to delete the old module explicitly to help GC
-    if old_module is not None:
-         # If old module holds parameters, they might need explicit deletion too,
-         # but Python's GC should handle it if no other references exist.
-         # Consider explicitly deleting parameters if memory issues persist
-         # for name, param in old_module.named_parameters(recurse=False):
-         #      del param
-         del old_module
+
+    # If there was an old module, try to clean it up
+    if old_module is not None and old_module is not new_module: # Ensure not same object
+         # === Attempt to clear children/parameters/buffers of old module ===
+         # print(f"DEBUG: Cleaning up old module: {child_name} ({type(old_module).__name__})")
+         try:
+            # Recursively delete children to break potential cycles
+            for name, child in list(old_module.named_children()):
+                 # print(f"  Deleting child: {name}")
+                 del child # Remove reference first
+                 # setattr(old_module, name, None) # Set attribute to None? Maybe too aggressive
+
+            # Clear internal dictionaries (use keys() + pop for safety during iteration)
+            if hasattr(old_module, '_modules'):
+                 for key in list(old_module._modules.keys()): old_module._modules.pop(key)
+            if hasattr(old_module, '_parameters'):
+                 for key in list(old_module._parameters.keys()): old_module._parameters.pop(key)
+            if hasattr(old_module, '_buffers'):
+                 for key in list(old_module._buffers.keys()): old_module._buffers.pop(key)
+            if hasattr(old_module, '_backward_hooks'): old_module._backward_hooks.clear()
+            if hasattr(old_module, '_forward_hooks'): old_module._forward_hooks.clear()
+            if hasattr(old_module, '_forward_pre_hooks'): old_module._forward_pre_hooks.clear()
+
+            # Finally delete the reference to the old module object itself
+            del old_module
+            gc.collect() # Encourage garbage collection immediately
+
+         except Exception as e:
+              print(f"Warning: Exception during old module cleanup for '{child_name}': {e}")
+              # Continue even if cleanup fails partially
+
 
 def find_modules(
     model: nn.Module,
@@ -82,24 +109,23 @@ def find_modules(
 ) -> List[Tuple[str, nn.Module]]:
     """ Finds modules matching target types or names, respecting exclusions. """
     found_modules = []
-    if not isinstance(target_names, list): target_names = [target_names] if target_names else [] # Ensure list
-    if not isinstance(target_types, list): target_types = [target_types] if target_types else [] # Ensure list
-    if not isinstance(exclude_names, list): exclude_names = [exclude_names] if exclude_names else [] # Ensure list
+    # Ensure inputs are lists for consistent processing
+    if not isinstance(target_names, list): target_names = [target_names] if target_names else []
+    if not isinstance(target_types, list): target_types = [target_types] if target_types else []
+    if not isinstance(exclude_names, list): exclude_names = [exclude_names] if exclude_names else []
 
     for name, module in model.named_modules():
         # Check exclusion list first
         is_excluded = False
         for exclusion in exclude_names:
-            # Check if exclusion is a direct match or substring based on need
-            # Simple substring check for now:
-            if exclusion and exclusion in name: # Ensure exclusion is not empty
+            if exclusion and exclusion in name: # Ensure exclusion is not empty string
                  is_excluded = True
                  break
         if is_excluded:
              continue
 
         # Check if type matches OR class name matches
-        type_match = any(isinstance(module, t) for t in target_types if t is not None) # Check t is not None
+        type_match = any(isinstance(module, t) for t in target_types if t is not None)
         name_match = type(module).__name__ in target_names
 
         if type_match or name_match:
@@ -126,7 +152,7 @@ def apply_atlas_quantization_to_model(
     patterns = _get_model_patterns(model_type)
     if patterns is None:
         print("ERROR: Cannot apply quantization, no patterns found.")
-        return # Exit if no patterns found
+        return
 
     # Ensure model is on CPU and correct dtype before proceeding
     try:
@@ -134,7 +160,6 @@ def apply_atlas_quantization_to_model(
         cleanup_memory()
     except Exception as e:
          print(f"Warning: Failed to move model to CPU/FP16 before quantization: {e}")
-         # Proceed cautiously, might fail later if dtype/device is wrong
 
     # Find target linear layers
     target_linear_types = patterns.get("linear_types", [])
@@ -156,42 +181,40 @@ def apply_atlas_quantization_to_model(
 
     layers_replaced = 0
     layers_failed = 0
-    # Using a list copy might be safer if replacement modifies named_modules iteration
+    # Use a list copy for safety during iteration if needed, though usually fine
     modules_list_copy = list(linear_modules_to_quantize)
 
     for name, module in modules_list_copy:
-        # Double check it's not already quantized
-        # Need to check the *current* module in the *actual model* in case it was replaced
-        parent_name_check, child_name_check = name.rsplit('.', 1) if '.' in name else ('', name)
-        parent_module_check = model.get_submodule(parent_name_check) if parent_name_check else model
-        current_module_in_model = getattr(parent_module_check, child_name_check, None)
-        if type(current_module_in_model).__name__ == 'QuantizedLinear':
-             # print(f"Skipping already quantized layer: {name}")
-             continue
-        # Also check the original reference just in case
-        if type(module).__name__ == 'QuantizedLinear':
-             continue
+        # Verify the module *currently* in the model at this name isn't already quantized
+        try:
+            parent_name_check, child_name_check = name.rsplit('.', 1) if '.' in name else ('', name)
+            parent_module_check = model.get_submodule(parent_name_check) if parent_name_check else model
+            current_module_in_model = getattr(parent_module_check, child_name_check, None)
+            if type(current_module_in_model).__name__ == 'QuantizedLinear':
+                 continue
+        except AttributeError:
+             print(f"Warning: Could not re-verify module {name}. Proceeding cautiously.")
 
 
         print(f"Quantizing layer: {name}...")
         try:
-            # Ensure weights/bias are accessible and on CPU/FP16
+            # Ensure weights/bias are accessible
             if not hasattr(module, 'weight') or module.weight is None:
                  print(f"Warning: Layer {name} (type: {type(module).__name__}) has no weight attribute. Skipping.")
                  layers_failed += 1
                  continue
 
+            # Ensure data is on CPU/FP16
             fp16_weight = module.weight.data.to(dtype=torch.float16, device='cpu')
             bias_data = module.bias.data if hasattr(module, 'bias') and module.bias is not None else None
             bias_tensor = bias_data.to(dtype=torch.float16, device='cpu') if bias_data is not None else None
 
             # Perform quantization
             quantized_weight_data = quantize_tensor(fp16_weight, **quantization_config)
-            # Ensure new bias tensor is created if original existed
-            new_bias_tensor = bias_tensor.clone() if bias_tensor is not None else None
+            new_bias_tensor = bias_tensor.clone() if bias_tensor is not None else None # Clone bias
             new_layer = QuantizedLinear(quantized_weight_data, new_bias_tensor)
 
-            # Replace module - find parent to perform setattr
+            # Replace module
             parent_name, child_name = name.rsplit('.', 1) if '.' in name else ('', name)
             parent_module = model.get_submodule(parent_name) if parent_name else model
             if parent_module is None:
@@ -202,22 +225,20 @@ def apply_atlas_quantization_to_model(
             _replace_module(parent_module, child_name, new_layer)
             layers_replaced += 1
 
-            # Explicitly delete temporary tensors to potentially save RAM
+            # Explicitly delete temporary tensors
             del fp16_weight, bias_data, bias_tensor, quantized_weight_data, new_bias_tensor
-            # Deleting old 'module' reference from the list doesn't affect the model structure
 
-            # Optional: Clean up memory less frequently if it slows things down too much
-            if (layers_replaced + layers_failed) % 20 == 0: # Clean every 20 layers processed
+            # Optional cleanup
+            if (layers_replaced + layers_failed) % 20 == 0:
                  cleanup_memory()
 
         except Exception as e:
             print(f"!! FAILED to quantize layer {name}: {e}")
-            traceback.print_exc() # Print stack trace for debugging
+            traceback.print_exc()
             layers_failed += 1
-            # Decide whether to continue or raise? Continue for now.
 
     print(f"--- Quantization complete. Replaced: {layers_replaced}, Failed/Skipped: {layers_failed} ---")
-    cleanup_memory() # Final cleanup
+    cleanup_memory()
 
 
 def apply_atlas_attention_wrapper(
@@ -227,7 +248,8 @@ def apply_atlas_attention_wrapper(
 ):
     """
     Replaces attention modules with AtlasAttentionWrapper IN PLACE.
-    Correctly handles finding the parent module for replacement.
+    Finds QKV/O projections WITHIN the identified attention module.
+    Includes Debugging Prints (limited).
     """
     print(f"\n--- Applying Atlas Attention Wrapper ({model_type}) ---")
     patterns = _get_model_patterns(model_type)
@@ -235,26 +257,22 @@ def apply_atlas_attention_wrapper(
         print("ERROR: Cannot apply attention wrapper, no patterns found.")
         return
 
-    attn_class_names = patterns.get("attention_type") # Expecting a list now
+    attn_class_names = patterns.get("attention_type", [])
     decoder_block_path = patterns.get("decoder_block_path")
-    attn_subpath_in_block = patterns.get("attention_subpath") # e.g., 'self_attn'
+    attn_subpath_in_block = patterns.get("attention_subpath")
 
-    if not isinstance(attn_class_names, list): # Ensure list
-         attn_class_names = [attn_class_names] if attn_class_names else []
-
+    if not isinstance(attn_class_names, list): attn_class_names = [attn_class_names] if attn_class_names else []
     if not all([attn_class_names, decoder_block_path, attn_subpath_in_block]):
-        print("Warning: Missing required patterns (attention_type list, decoder_block_path, attention_subpath) "
-              f"for model type '{model_type}'. Cannot wrap attention.")
+        print("Warning: Missing required patterns for attention wrapping. Cannot wrap.")
         return
 
-    # Find the nn.ModuleList containing the decoder layers
     try:
         decoder_layers_list = model.get_submodule(decoder_block_path)
         if not isinstance(decoder_layers_list, nn.ModuleList):
-             print(f"Warning: Path '{decoder_block_path}' did not yield an nn.ModuleList. Cannot wrap attention.")
+             print(f"Warning: Path '{decoder_block_path}' did not yield an nn.ModuleList. Cannot wrap.")
              return
     except AttributeError:
-        print(f"Warning: Could not find decoder layers at path '{decoder_block_path}'. Cannot wrap attention.")
+        print(f"Warning: Path '{decoder_block_path}' not found. Cannot wrap.")
         return
 
     print(f"Found {len(decoder_layers_list)} decoder layers at '{decoder_block_path}'.")
@@ -262,63 +280,88 @@ def apply_atlas_attention_wrapper(
     layers_failed = 0
 
     for layer_idx, decoder_layer in enumerate(decoder_layers_list):
+        print_debug = layer_idx < 2 # Limit debug output
         try:
-            # === Correctly find the PARENT and NAME of the attention module ===
+            # Find parent and name of attention module
             parent_module = decoder_layer
             name_chain = attn_subpath_in_block.split('.')
-            child_name = name_chain[-1]
-            # Traverse the path if it's nested (e.g., 'block.attn')
+            child_attn_name = name_chain[-1]
             if len(name_chain) > 1:
                 parent_path = ".".join(name_chain[:-1])
-                # Need safe getattr with default None
                 parent_module_candidate = decoder_layer.get_submodule(parent_path)
                 if parent_module_candidate is None:
-                     print(f"Warning: Could not find parent path '{parent_path}' in layer {layer_idx}. Skipping.")
-                     layers_failed += 1
-                     continue
+                     print(f"Warning: Parent path '{parent_path}' not found layer {layer_idx}. Skip.")
+                     layers_failed += 1; continue
                 parent_module = parent_module_candidate
 
-            # === Get the original module using getattr ===
-            original_attn_module = getattr(parent_module, child_name, None)
-            # =============================================
-
+            original_attn_module = getattr(parent_module, child_attn_name, None)
             if original_attn_module is None:
-                 print(f"Warning: Could not find submodule '{child_name}' in parent '{type(parent_module).__name__}' "
-                       f"(derived from path '{attn_subpath_in_block}') within decoder layer {layer_idx}. Skipping wrap.")
-                 layers_failed += 1
-                 continue # Skip to next layer
+                 print(f"Warning: Submodule '{child_attn_name}' not found layer {layer_idx}. Skip.")
+                 layers_failed += 1; continue
 
             current_attn_type_name = type(original_attn_module).__name__
 
-            # Check if type name is in the list and not already wrapped
+            # Check if wrapping needed
             if current_attn_type_name in attn_class_names and \
                not isinstance(original_attn_module, AtlasAttentionWrapper):
 
-                print(f"Wrapping attention ({current_attn_type_name}) for layer {layer_idx} (replacing '{child_name}' on parent {type(parent_module).__name__})...")
-                # Create wrapper with the *original* module instance and the PARENT decoder layer
-                # Ensure parent_layer is the actual decoder layer block (e.g., OPTDecoderLayer)
+                if print_debug: # Conditional Debug Prints
+                    print(f"\n[DEBUG] Layer {layer_idx}: Found Attention Module Path: "
+                          f"{decoder_block_path}.{layer_idx}.{attn_subpath_in_block}")
+                    print(f"[DEBUG] Layer {layer_idx}: Found Attention Module Type: {current_attn_type_name}")
+                    # print(f"[DEBUG] Layer {layer_idx}: Instance: {original_attn_module}") # Might be too verbose
+                    print(f"[DEBUG] Layer {layer_idx}: Checking attributes within original_attn_module ({current_attn_type_name})...")
+
+                print(f"Attempting to wrap attention ({current_attn_type_name}) layer {layer_idx}...")
+
+                # Find Q/K/V/O Projections WITHIN the original attention module
+                q_proj = getattr(original_attn_module, 'q_proj', None)
+                k_proj = getattr(original_attn_module, 'k_proj', None)
+                v_proj = getattr(original_attn_module, 'v_proj', None)
+                o_proj = getattr(original_attn_module, 'out_proj', None) # Corrected name 'out_proj'
+
+                # Try alternate names only if needed
+                if not all([q_proj, k_proj, v_proj, o_proj]):
+                     if print_debug: print("[DEBUG] Trying alternate QKVO names (Wq, Wk, Wv, Wo)...")
+                     if not q_proj: q_proj = getattr(original_attn_module, 'Wq', None)
+                     if not k_proj: k_proj = getattr(original_attn_module, 'Wk', None)
+                     if not v_proj: v_proj = getattr(original_attn_module, 'Wv', None)
+                     if not o_proj: o_proj = getattr(original_attn_module, 'Wo', None)
+
+                # Check if all projection layers were found
+                if not all([q_proj, k_proj, v_proj, o_proj]):
+                      print(f"ERROR: Could not find all Q/K/V/O projection layers *within* the attention module "
+                            f"'{type(original_attn_module).__name__}' for layer {layer_idx}. Skipping wrap.")
+                      if print_debug:
+                          print(f"  Found: q={q_proj is not None}, k={k_proj is not None}, "
+                                f"v={v_proj is not None}, o={o_proj is not None}")
+                      layers_failed += 1
+                      continue # Skip this layer
+
+                # Create wrapper, passing projection layers explicitly
                 wrapped_attn = AtlasAttentionWrapper(
-                    original_attn_module=original_attn_module,
-                    parent_layer=decoder_layer, # Pass the whole decoder layer block
+                    # original_attn_module=original_attn_module, # Can remove if not needed by wrapper init
+                    parent_layer=decoder_layer,
+                    q_proj=q_proj,
+                    k_proj=k_proj,
+                    v_proj=v_proj,
+                    o_proj=o_proj,
                     memory_manager=memory_manager,
                     layer_idx=layer_idx
                 )
 
-                # Replace the module on the PARENT
-                _replace_module(parent_module, child_name, wrapped_attn)
+                # Replace the original attention module on its parent
+                _replace_module(parent_module, child_attn_name, wrapped_attn)
+                print(f"Successfully wrapped attention for layer {layer_idx}.")
                 layers_wrapped += 1
 
             elif isinstance(original_attn_module, AtlasAttentionWrapper):
-                 # This case should ideally not happen if logic is correct, but good to have
-                 print(f"Skipping already wrapped attention for layer {layer_idx}.")
-            # Check if expected type but skipped (e.g., not in list now, maybe log difference)
+                 print(f"Skipping already wrapped attention layer {layer_idx}.")
             elif current_attn_type_name not in attn_class_names:
-                 # This was hit before, should be less common now with SDPA names included
-                 print(f"Warning: Module '{child_name}' in layer {layer_idx} has unexpected type "
-                       f"'{current_attn_type_name}', expected one of {attn_class_names}. Skipping wrap.")
+                 print(f"Warning: Module '{child_attn_name}' layer {layer_idx} type '{current_attn_type_name}' not in target list {attn_class_names}. Skip.")
 
-        except AttributeError as ae: # Catch errors during submodule access more specifically
-             print(f"Warning: AttributeError finding/accessing attention in layer {layer_idx} (Path: {attn_subpath_in_block}): {ae}. Skipping wrap.")
+        except AttributeError as ae:
+             print(f"Warning: AttributeError processing attention layer {layer_idx}: {ae}. Skipping.")
              layers_failed += 1
         except Exception as e:
              print(f"!! FAILED to process attention for layer {layer_idx}: {e}")
@@ -337,9 +380,8 @@ def setup_offloading_hooks(model: nn.Module, model_type: str, gpu_device: torch.
         print("ERROR: Cannot setup hooks, no patterns found.")
         return
 
-    # Hook the decoder layer blocks - the hook will handle internal QuantizedLinear layers
     decoder_layer_type_name = patterns.get("decoder_layer_type")
-    decoder_block_path = patterns.get("decoder_block_path") # Path to ModuleList
+    decoder_block_path = patterns.get("decoder_block_path")
 
     if not decoder_layer_type_name or not decoder_block_path:
         print("Warning: Missing 'decoder_layer_type' or 'decoder_block_path' pattern. Cannot add hooks precisely.")
@@ -348,22 +390,18 @@ def setup_offloading_hooks(model: nn.Module, model_type: str, gpu_device: torch.
     try:
         decoder_layers_list = model.get_submodule(decoder_block_path)
         if not isinstance(decoder_layers_list, nn.ModuleList):
-             print(f"Warning: Path '{decoder_block_path}' did not yield an nn.ModuleList. Cannot add hooks.")
+             print(f"Warning: Path '{decoder_block_path}' not nn.ModuleList. Cannot add hooks.")
              return
     except AttributeError:
-        print(f"Warning: Could not find decoder layers at path '{decoder_block_path}'. Cannot add hooks.")
+        print(f"Warning: Path '{decoder_block_path}' not found. Cannot add hooks.")
         return
 
     hooks_added = 0
     print(f"Found {len(decoder_layers_list)} decoder layer blocks ({decoder_layer_type_name}) to hook.")
     for i, layer_module in enumerate(decoder_layers_list):
-         # Attach the hook to the entire decoder layer block.
-         # Use a dictionary for execution_device mapping specific to this module instance.
          try:
-              # The hook's pre/post_forward will inspect submodules within this block.
-              # The hook needs to know the target device for this specific layer module
-              # Accelerate hook takes map: {module_instance: device}
-              # Ensure the hook instance is unique per layer if needed, though state might be okay
+              # Use a dictionary for execution_device mapping specific to this module instance.
+              # Ensure unique hook instance per layer block if hook stores state per block (current impl doesn't heavily)
               hook = QuantizedTensorOffloadHook(execution_device={layer_module: gpu_device})
               add_hook_to_module(layer_module, hook)
               hooks_added += 1
@@ -374,11 +412,9 @@ def setup_offloading_hooks(model: nn.Module, model_type: str, gpu_device: torch.
 
     # Also hook the LM head if it was quantized
     lm_head = getattr(model, 'lm_head', None)
-    # Check by type name to avoid direct import dependency on QuantizedLinear here
     if lm_head and type(lm_head).__name__ == 'QuantizedLinear':
          try:
               print("Adding hook to lm_head...")
-              # Create a new hook instance for the lm_head specifically
               lm_head_hook = QuantizedTensorOffloadHook(execution_device={lm_head: gpu_device})
               add_hook_to_module(lm_head, lm_head_hook)
               hooks_added += 1
