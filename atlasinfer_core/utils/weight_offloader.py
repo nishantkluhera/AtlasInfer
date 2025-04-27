@@ -1,164 +1,177 @@
 # atlasinfer_core/utils/weight_offloader.py
 import torch
+import torch.nn as nn # Import nn for type check
+import os # For PID
+# === Use local map_structure ===
+from .helpers import map_structure # Import from local helpers.py
+# ===============================
 from accelerate.hooks import AlignDevicesHook, add_hook_to_module
-# Use typing.TYPE_CHECKING or direct relative import
-from typing import TYPE_CHECKING
+from typing import Any, Dict, Optional, Union, Tuple, TYPE_CHECKING # Import necessary types
+import threading # For cache lock
+import gc
+import weakref # To avoid strong references in cache potentially
+import traceback # For debugging prints
+
+# Use TYPE_CHECKING guard for QuantizedTensor hint if defined elsewhere
 if TYPE_CHECKING:
     from ..quant.adaptive_quantizer import QuantizedTensor
 
-# Import concrete classes needed at runtime
-from ..quant.adaptive_quantizer import QuantizedTensor, dequantize_tensor, clear_dequantized_cache
-import gc
+# === Import ONLY QuantizedTensor from quantizer ===
+from ..quant.adaptive_quantizer import QuantizedTensor
+# ================================================
 
-# --- Custom Hook for Quantized Tensors ---
+
+# === RESTORE Cache dict, lock, and clear functions LOCALLY ===
+_dequantized_weights_cache: Dict[int, weakref.ReferenceType[torch.Tensor]] = {}
+_cache_lock = threading.Lock()
+
+def _clear_specific_dequant_cache(obj_id):
+     """Clears a specific entry from the dequant cache."""
+     global _dequantized_weights_cache
+     with _cache_lock:
+          if obj_id in _dequantized_weights_cache:
+               # print(f"DEBUG: Clearing dequant cache for ID {obj_id}") # Verbose Debug
+               del _dequantized_weights_cache[obj_id]
+
+def clear_all_dequant_cache():
+    """Clears the entire dequantization cache."""
+    global _dequantized_weights_cache
+    with _cache_lock:
+        # print("DEBUG: Clearing ALL dequant cache.") # Verbose Debug
+        _dequantized_weights_cache = {}
+    if torch.cuda.is_available():
+         gc.collect()
+         torch.cuda.empty_cache()
+# =========================================================
+
+# --- Custom Hook ---
 class QuantizedTensorOffloadHook(AlignDevicesHook):
     """
-    An accelerate Hook to offload/reload QuantizedTensor components within modules.
-    Specifically targets modules expected to contain a 'quantized_weights' attribute
-    of type QuantizedTensor (like our QuantizedLinear). It iterates through submodules
-    of the hooked module (e.g., a DecoderLayer) to move weights/bias before/after execution.
+    Accelerate hook extending AlignDevicesHook. Overrides _move_to_device to handle
+    QuantizedTensor/QuantizedLinear. Relies on module.to() in pre/post forward
+    for moving hooked block and children. Manages dequantization cache clearing.
     """
-    def __init__(self, execution_device=None):
-        """
-        Initializes the hook.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.hooked_module_original_devices: dict[int, torch.device] = {}
+        print(f"QuantizedTensorOffloadHook Initialized (Offload Mode: {self.offload}, ExecDev: {self.execution_device}).")
 
-        Args:
-            execution_device: The target device (e.g., 'cuda:0') or a dictionary mapping
-                              modules to devices, as expected by Accelerate's AlignDevicesHook.
-        """
-        super().__init__(execution_device=execution_device)
-        # Store original device of components for each hooked module instance's QuantizedLinear submodules
-        # Key: id(QuantizedLinear submodule), Value: torch.device
-        # Using submodule ID is more precise if multiple QLinear share a parent hook
-        self.original_submodule_devices: dict[int, torch.device] = {}
-        # Keep track of which submodules were moved in pre_forward to only move them back
-        self.moved_in_pre_forward: set[int] = set()
+    def __deepcopy__(self, memo=None): return self
+
+    def _move_to_device(self, obj: Any, device: torch.device):
+        """ Override internal move method for custom types. """
+        if obj is None: return None
+        # Use LOCALLY defined clear function
+        if isinstance(obj, QuantizedTensor):
+            if obj.fp8_data.device != device:
+                 _clear_specific_dequant_cache(id(obj))
+                 return obj.to(device)
+            else: return obj
+        elif type(obj).__name__ == 'QuantizedLinear':
+            q_tensor = getattr(obj, 'quantized_weights', None)
+            bias = getattr(obj, 'bias', None)
+            if q_tensor is not None and isinstance(q_tensor, QuantizedTensor):
+                 if q_tensor.fp8_data.device != device:
+                     _clear_specific_dequant_cache(id(q_tensor))
+                     setattr(obj, 'quantized_weights', q_tensor.to(device))
+            if bias is not None and bias.device != device:
+                 setattr(obj, 'bias', bias.to(device))
+            # Check if module needs move (needed if QuantizedLinear has other params/buffers)
+            if hasattr(obj, 'to') and getattr(obj, 'device', device) != device:
+                return obj.to(device)
+            else:
+                return obj # Return potentially modified module
+        elif isinstance(obj, (torch.nn.Module, torch.Tensor)):
+             if hasattr(obj, 'to') and getattr(obj, 'device', device) != device:
+                 return obj.to(device)
+             else: return obj
+        else: return obj
 
 
     def pre_forward(self, module, *args, **kwargs):
-        """
-        Moves QuantizedTensor components and bias of relevant *submodules*
-        to execution_device before the hooked module's forward executes.
-        """
-        parent_module_id = id(module)
-        print(f"\n>>> Hook Pre-Fwd START Layer Block ID: {parent_module_id} ({type(module).__name__})") # DEBUG START
-        self.moved_in_pre_forward.clear() # Reset for this forward pass
+        """ Moves hooked module and inputs (args/kwargs) to target device. """
+        parent_module_id = id(module); pid_str=f"[PID:{os.getpid()}]"
+        # print(f"\n{pid_str} >>> Hook Pre START {type(module).__name__} (ID: {parent_module_id})") # Debug
 
-        # Determine target execution device for the parent module
-        if isinstance(self.execution_device, dict):
-            target_device = self.execution_device.get(module, self.execution_device.get(None))
+        # 1. Determine Target Device
+        if isinstance(self.execution_device, dict): target_device = self.execution_device.get(module, self.execution_device.get(None))
+        else: target_device = self.execution_device
+        if target_device is None: return args, kwargs
+
+        # 2. Store Original Device & Determine Current Device
+        current_device = None
+        if parent_module_id not in self.hooked_module_original_devices:
+             try:
+                  first_param = next(iter(module.parameters()), None); first_buffer = next(iter(module.buffers()), None)
+                  if first_param is not None: param_device = first_param.device
+                  elif first_buffer is not None: param_device = first_buffer.device
+                  else: param_device = torch.device("cpu")
+                  self.hooked_module_original_devices[parent_module_id] = param_device
+                  current_device = param_device
+             except Exception: self.hooked_module_original_devices[parent_module_id] = torch.device("cpu"); current_device = torch.device("cpu")
         else:
-            target_device = self.execution_device
+             try: current_device = next(iter(module.parameters()), torch.tensor(0)).device
+             except StopIteration: current_device = torch.device("cpu")
 
-        if target_device is None:
-            print(f"Warning: Hook on {type(module).__name__}: No target device found. Skipping pre_forward moves.")
-            return args, kwargs # Return original args/kwargs
+        original_device = self.hooked_module_original_devices[parent_module_id]
 
-        # --- Iterate through submodules of the hooked module ---
-        moved_count = 0
-        submodules_processed = 0
-        for submodule_name, submodule in module.named_modules():
-            # Check if the submodule is a QuantizedLinear layer
-            # Using type name check for robustness against potential import issues
-            if type(submodule).__name__ == 'QuantizedLinear':
-                submodules_processed += 1
-                submodule_id = id(submodule)
-                q_tensor = getattr(submodule, 'quantized_weights', None)
+        # 3. Move Parent Module if needed
+        if current_device != target_device:
+            # print(f"{pid_str}     Hook Pre: Moving parent module {type(module).__name__} ({current_device} -> {target_device})") # Debug
+            try:
+                # Calling module.to() SHOULD implicitly use our _move_to_device override
+                # for children like QuantizedLinear / QuantizedTensor
+                module.to(target_device)
+            except NotImplementedError as nie:
+                  print(f"!! Hook Pre: CAUGHT NotImplementedError moving {type(module).__name__}: {nie}")
+                  raise nie
+            except Exception as e:
+                 print(f"{pid_str}   !! Hook Pre: Parent move ERROR: {e}"); traceback.print_exc(); raise e
 
-                if q_tensor is not None and isinstance(q_tensor, QuantizedTensor):
-                    # Store original device if not already stored
-                    if submodule_id not in self.original_submodule_devices:
-                        self.original_submodule_devices[submodule_id] = q_tensor.fp8_data.device
-                        # print(f"    Hook Pre: Storing original device {self.original_submodule_devices[submodule_id]} for {submodule_name} ({submodule_id})") # Verbose Debug
+        # 4. Move args/kwargs Tensors using map_structure
+        # print(f"{pid_str}     Hook Pre: Moving args/kwargs START...") # Debug
+        try:
+             move_func = lambda t: self._move_to_device(t, target_device)
+             moved_args = map_structure(move_func, args)
+             moved_kwargs = map_structure(move_func, kwargs)
+             # print(f"{pid_str}     Hook Pre: Moving args/kwargs END.") # Debug
+        except Exception as e: print(f"ERROR map_structure pre_fwd: {e}"); traceback.print_exc(); return args, kwargs
 
-                    # Move QuantizedTensor components if needed
-                    if q_tensor.fp8_data.device != target_device:
-                        # print(f"    Hook Pre: Moving weights {submodule_name} ({submodule_id}) -> {target_device}") # Debug Move
-                        setattr(submodule, 'quantized_weights', q_tensor.to(target_device))
-                        self.moved_in_pre_forward.add(submodule_id) # Track that we moved this one
-                        moved_count += 1
-
-                    # Move bias if needed
-                    bias = getattr(submodule, 'bias', None)
-                    if bias is not None and bias.device != target_device:
-                        # print(f"    Hook Pre: Moving bias {submodule_name} ({submodule_id}) -> {target_device}") # Debug Move
-                        setattr(submodule, 'bias', bias.to(target_device))
-                        # If weights weren't moved but bias was, still track submodule? Yes.
-                        self.moved_in_pre_forward.add(submodule_id)
-                else:
-                     print(f"    Warning: Hook Pre: {submodule_name} is QuantizedLinear but has no valid quantized_weights.")
-
-        print(f"<<< Hook Pre-Fwd END Layer Block ID: {parent_module_id}. Processed {submodules_processed} QLinear. Moved {moved_count} weights.") # DEBUG END
-        # === Corrected Return Statement ===
-        # Return only args and kwargs, as expected by Accelerate's hook mechanism
-        return args, kwargs
-        # ================================
+        # print(f"{pid_str} <<< Hook Pre END {type(module).__name__}.") # Debug
+        return moved_args, moved_kwargs # Return potentially modified args/kwargs
 
 
     def post_forward(self, module, output, *args, **kwargs):
-        """
-        Moves QuantizedTensor components and bias of relevant *submodules*
-        back to their original device after the hooked module's forward executes.
-        """
-        parent_module_id = id(module)
-        print(f"\n>>> Hook Post-Fwd START Layer Block ID: {parent_module_id} ({type(module).__name__})") # DEBUG START
+        """ Moves hooked module back if offload=True and clears cache. """
+        parent_module_id = id(module); pid_str=f"[PID:{os.getpid()}]"
+        # print(f"\n{pid_str} >>> Hook Post START {type(module).__name__} (ID: {parent_module_id})") # Debug
 
-        moved_back_count = 0
-        submodules_processed = 0
-        # --- Iterate through submodules to move them back ---
-        # Need original_devices populated correctly in pre_forward
+        # 1. Move module back to original device if offload=True
+        moved_back = False
+        if self.offload and parent_module_id in self.hooked_module_original_devices:
+            original_device = self.hooked_module_original_devices[parent_module_id]
+            try: current_device = next(iter(module.parameters()), torch.tensor(0, device=original_device)).device
+            except StopIteration: current_device = original_device
+
+            if current_device != original_device:
+                # print(f"{pid_str}     Hook Post: Moving module {type(module).__name__} back to {original_device}") # Debug
+                try:
+                     # module.to() should use our _move_to_device override for children
+                     module.to(original_device)
+                     moved_back = True
+                except Exception as e: print(f"{pid_str}   !! Hook Post: Parent move back ERROR: {e}")
+
+        # 2. Clear dequant cache AFTER potential move back
+        caches_cleared = 0
+        # print(f"{pid_str}     Hook Post: Clearing dequant caches...") # Debug
         for submodule_name, submodule in module.named_modules():
             if type(submodule).__name__ == 'QuantizedLinear':
-                submodules_processed += 1
-                submodule_id = id(submodule)
+                q_tensor = getattr(submodule, 'quantized_weights', None)
+                if q_tensor is not None and isinstance(q_tensor, QuantizedTensor):
+                    # === Use the LOCALLY defined clear function ===
+                    _clear_specific_dequant_cache(id(q_tensor))
+                    # ============================================
+                    caches_cleared += 1
 
-                # Only move back if it was moved by this hook instance in pre_forward
-                # and if we know its original device
-                if submodule_id in self.moved_in_pre_forward and \
-                   submodule_id in self.original_submodule_devices:
-
-                    original_device = self.original_submodule_devices[submodule_id]
-                    q_tensor = getattr(submodule, 'quantized_weights', None)
-
-                    # Determine current device (should be the target_device from pre_forward)
-                    current_device = None
-                    if q_tensor is not None and isinstance(q_tensor, QuantizedTensor):
-                         current_device = q_tensor.fp8_data.device
-
-                    # Only move if currently on execution device AND original is different
-                    if current_device is not None and current_device != original_device:
-                         # print(f"    Hook Post: Moving weights {submodule_name} ({submodule_id}) -> {original_device}") # Debug Move Back
-                         setattr(submodule, 'quantized_weights', q_tensor.to(original_device))
-                         moved_back_count += 1
-                         # Clear the dequantization cache associated with this specific QTensor object ID
-                         clear_dequantized_cache(id(q_tensor))
-
-                         # Move bias back if needed
-                         bias = getattr(submodule, 'bias', None)
-                         if bias is not None and bias.device != original_device:
-                              # print(f"    Hook Post: Moving bias {submodule_name} ({submodule_id}) -> {original_device}") # Debug Move Back
-                              setattr(submodule, 'bias', bias.to(original_device))
-                    # Handle case where maybe only bias was moved? Less likely but possible.
-                    elif current_device == original_device:
-                         bias = getattr(submodule, 'bias', None)
-                         if bias is not None and bias.device != original_device:
-                              # print(f"    Hook Post: Moving bias ONLY for {submodule_name} ({submodule_id}) -> {original_device}") # Debug
-                              setattr(submodule, 'bias', bias.to(original_device))
-
-                # else: # Debug if not moved back
-                #     if submodule_id in self.moved_in_pre_forward:
-                #         print(f"    Hook Post: {submodule_name} ({submodule_id}) was moved pre, but not moving back (orig dev not found or already there?).")
-                #     else:
-                #         print(f"    Hook Post: {submodule_name} ({submodule_id}) was not moved pre, skipping.")
-
-        # Clear the tracking set for the next forward pass
-        self.moved_in_pre_forward.clear()
-        # Optional: Aggressive cleanup if memory is tight
-        # gc.collect()
-        # if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-        print(f"<<< Hook Post-Fwd END Layer Block ID: {parent_module_id}. Processed {submodules_processed} QLinear. Moved back {moved_back_count} weights.") # DEBUG END
-        # === Return the original output ===
-        # Standard accelerate post_forward hook returns the output
-        return output
-        # ================================
+        # print(f"<<< Hook Post End {type(module).__name__}. Moved back: {moved_back}. Cleared {caches_cleared} caches.") # Debug
+        return output # Return the original output

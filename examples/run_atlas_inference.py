@@ -91,7 +91,8 @@ def profile_memory_usage(step, log_prefix=""):
         allocated = torch.cuda.memory_allocated(0) / (1024**2)
         reserved = torch.cuda.memory_reserved(0) / (1024**2)
         print(f"\r{log_prefix} Step {step}: VRAM Allocated={allocated:.1f} MB, Reserved={reserved:.1f} MB", end='')
-    except Exception as e: print(f"\rError profiling memory: {e}", end='')
+    except Exception as e:
+         print(f"\rError profiling memory: {e}", end='')
 
 
 # ==============================================
@@ -99,89 +100,101 @@ def profile_memory_usage(step, log_prefix=""):
 # ==============================================
 def main():
     args = parse_args()
+    # --- Seeding ---
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(args.seed)
-    cleanup_memory()
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    cleanup_memory() # Start clean
 
     print("--- AtlasInfer Inference Script ---")
     print(f"Model: {args.model_name_or_path} (Revision: {args.revision})")
     if args.use_hf_baseline: print("Mode: Hugging Face FP16 Baseline")
     elif args.use_bnb_4bit: print("Mode: Hugging Face + BitsAndBytes 4-bit Baseline")
     else: print("Mode: AtlasInfer")
-    print("-" * 30)
+    print("-" * 30) # Separator
 
+    # --- Setup Devices ---
     gpu_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     cpu_device = torch.device("cpu")
     print(f"Using GPU: {gpu_device}, CPU: {cpu_device}")
     if gpu_device == cpu_device and args.force_cpu_offload:
-        print("Warning: CPU offload forced but no GPU. Disabling offload.")
+        print("Warning: CPU offload forced but no GPU available. Disabling offload.")
         args.force_cpu_offload = False
 
+    # --- Load Tokenizer & Config ---
     print("\nLoading tokenizer and config...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, revision=args.revision)
         config = AutoConfig.from_pretrained(args.model_name_or_path, revision=args.revision, trust_remote_code=args.trust_remote_code)
-    except Exception as e: print(f"ERROR: Load tokenizer/config failed: {e}"); return 1
+    except Exception as e:
+        print(f"ERROR: Failed to load tokenizer or config for {args.model_name_or_path}: {e}")
+        return 1
 
     if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token_id is not None: tokenizer.pad_token_id = tokenizer.eos_token_id; print(f"Set pad_token_id to eos: {tokenizer.eos_token_id}")
-        else: tokenizer.add_special_tokens({'pad_token': '[PAD]'}); config.pad_token_id = tokenizer.pad_token_id; print("Added [PAD] token.")
+        if tokenizer.eos_token_id is not None:
+             tokenizer.pad_token_id = tokenizer.eos_token_id
+             print(f"Set pad_token_id to eos_token_id: {tokenizer.eos_token_id}")
+        else:
+             tokenizer.add_special_tokens({'pad_token': '[PAD]'}); config.pad_token_id = tokenizer.pad_token_id
+             print(f"Added [PAD] token as pad_token (ID: {tokenizer.pad_token_id}).")
 
     model_type = args.model_type or getattr(config, "model_type", None)
-    if not model_type: print("ERROR: Cannot determine model_type."); return 1
+    if not model_type: print("ERROR: Could not determine model_type."); return 1
     print(f"Determined Model Type: {model_type}")
 
     if not args.use_hf_baseline and not args.use_bnb_4bit:
-        if _get_model_patterns(model_type) is None: print(f"ERROR: AtlasInfer patterns undefined for '{model_type}'."); return 1
+        if _get_model_patterns(model_type) is None:
+             print(f"ERROR: AtlasInfer patterns not defined for '{model_type}'."); return 1
         print(f"AtlasInfer patterns found for '{model_type}'.")
 
+    # --- Prepare Model Kwargs ---
     model_kwargs = {"revision": args.revision, "trust_remote_code": args.trust_remote_code}
     load_on_cpu = True
     if args.use_hf_baseline and not args.use_bnb_4bit: model_kwargs["torch_dtype"] = torch.float16
     elif args.use_bnb_4bit:
         try: import bitsandbytes; print("BitsAndBytes library found.")
-        except ImportError: print("ERROR: bitsandbytes not installed."); return 1
+        except ImportError: print("ERROR: --use_bnb_4bit requires 'bitsandbytes'."); return 1
         model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4")
         model_kwargs["device_map"] = "auto"; load_on_cpu = False
 
+    # --- Load Model ---
     print("\nLoading model...")
-    model = None; memory_manager = None; use_cpu_offload = False
+    model = None
+    memory_manager = None
+    use_cpu_offload = False # Determined later for AtlasInfer path
 
     try:
         if not args.use_hf_baseline and not args.use_bnb_4bit:
             # --- AtlasInfer Path ---
             print("  Loading FULL FP16 model onto CPU (RAM intensive)...")
             try:
-                model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=torch.float16, low_cpu_mem_usage=True, **model_kwargs).to(cpu_device)
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_name_or_path, torch_dtype=torch.float16, low_cpu_mem_usage=True, **model_kwargs
+                ).to(cpu_device)
                 print("  FP16 model loaded to CPU."); cleanup_memory()
             except Exception as e: print(f"ERROR loading FP16 weights: {e}"); raise
 
             quantization_config = {"block_size": args.quant_block_size, "z_threshold": args.quant_z_threshold}
-            apply_atlas_quantization_to_model(model, model_type, quantization_config)
-            print("  Model quantized."); cleanup_memory()
+            apply_atlas_quantization_to_model(model, model_type, quantization_config); cleanup_memory(); print("  Model quantized.")
 
-            print("  Initializing Unified Memory Manager...")
-            disk_path = None if not args.disk_cache_path or args.disk_cache_path.lower() == 'none' else args.disk_cache_path
+            print("  Initializing Unified Memory Manager..."); disk_path = None if not args.disk_cache_path or args.disk_cache_path.lower() == 'none' else args.disk_cache_path
             kv_cache_vram_limit_bytes = get_effective_vram_limit(args.vram_limit_gb)
-            memory_manager = UnifiedMemoryManager(kv_cache_vram_limit_bytes / (1024**3), args.ram_cache_limit_gb, disk_path, args.disk_cache_limit_gb if disk_path else 0, gpu_device, cpu_device, args.vram_only_kv_cache)
+            memory_manager = UnifiedMemoryManager(
+                vram_limit_gb=kv_cache_vram_limit_bytes / (1024**3), ram_limit_gb=args.ram_cache_limit_gb,
+                disk_path=disk_path, disk_limit_gb=args.disk_cache_limit_gb if disk_path else 0,
+                gpu_device=gpu_device, cpu_device=cpu_device, vram_only_kv_cache=args.vram_only_kv_cache)
 
-            apply_atlas_attention_wrapper(model, model_type, memory_manager)
-            print("  Attention layers wrapped."); cleanup_memory()
+            apply_atlas_attention_wrapper(model, model_type, memory_manager); cleanup_memory(); print("  Attention layers wrapped.")
 
-            total_available_vram_bytes = get_effective_vram_limit(None)
-            safe_kv_cache_limit_bytes = min(kv_cache_vram_limit_bytes, total_available_vram_bytes)
-            vram_for_model_bytes = max(0, total_available_vram_bytes - safe_kv_cache_limit_bytes)
-            activation_buffer_bytes = min(int(0.5 * 1024**3), int(vram_for_model_bytes * 0.1))
-            effective_vram_for_params = max(0, vram_for_model_bytes - activation_buffer_bytes)
-            vram_for_model_gb = vram_for_model_bytes / (1024**3)
+            total_available_vram_bytes = get_effective_vram_limit(None); safe_kv_cache_limit_bytes = min(kv_cache_vram_limit_bytes, total_available_vram_bytes)
+            vram_for_model_bytes = max(0, total_available_vram_bytes - safe_kv_cache_limit_bytes); activation_buffer_bytes = min(int(0.5 * 1024**3), int(vram_for_model_bytes * 0.1))
+            effective_vram_for_params = max(0, vram_for_model_bytes - activation_buffer_bytes); vram_for_model_gb = vram_for_model_bytes / (1024**3)
             effective_vram_for_params_gb = effective_vram_for_params / (1024**3)
-            print(f"\nEstimated VRAM available for model parameters: {vram_for_model_gb:.2f} GB")
-            print(f"  (Reserving ~{(activation_buffer_bytes / (1024**2)):.0f} MB for activations)")
+            print(f"\nEstimated VRAM available for model parameters: {vram_for_model_gb:.2f} GB (~{(activation_buffer_bytes / (1024**2)):.0f} MB reserved)")
             print(f"  Effective VRAM for parameters: {effective_vram_for_params_gb:.2f} GB")
-
-            estimated_model_params_bytes = estimate_quantized_model_vram(model)
-            estimated_model_params_gb = estimated_model_params_bytes / (1024**3)
+            estimated_model_params_bytes = estimate_quantized_model_vram(model); estimated_model_params_gb = estimated_model_params_bytes / (1024**3)
             print(f"Estimated VRAM needed for quantized parameters: {estimated_model_params_gb:.2f} GB")
 
             if args.force_cpu_offload: use_cpu_offload = True; print("CPU weight offload ENABLED (forced).")
@@ -189,84 +202,78 @@ def main():
             elif gpu_device == cpu_device: use_cpu_offload = False; print("CPU weight offload DISABLED (no GPU).")
             else: use_cpu_offload = False; print("CPU weight offload DISABLED (fits VRAM).")
 
-            model.to(cpu_device)
+            model.to(cpu_device) # Ensure start on CPU
             if use_cpu_offload:
-                 setup_offloading_hooks(model, model_type, gpu_device); print("Model remains on CPU; hooks manage GPU execution.")
+                 setup_offloading_hooks(model, model_type, gpu_device) # Hook non-quantized final_ln/lm_head too
+                 print("Model remains on CPU; hooks manage GPU execution.")
             elif gpu_device != cpu_device:
-                 print(f"Moving model parameters to GPU ({gpu_device})...")
-                 try: model.to(gpu_device); cleanup_memory(); print("Model moved to GPU.")
-                 except Exception as e: print(f"ERROR moving model to GPU: {e}"); raise
-            else: print("Model remains on CPU (no GPU available).")
+                 print(f"Moving model parameters to GPU ({gpu_device})..."); model.to(gpu_device); cleanup_memory(); print("Model moved to GPU.")
+            else: print("Model remains on CPU.")
 
         else: # Baseline Path
-            mode_str = 'FP16' if not args.use_bnb_4bit else 'BitsAndBytes 4bit'
-            print(f"\nLoading baseline model ({mode_str})...")
+            mode_str = 'FP16' if not args.use_bnb_4bit else 'BitsAndBytes 4bit'; print(f"\nLoading baseline model ({mode_str})...")
             try:
                 if load_on_cpu:
                      print("  Loading weights to CPU..."); model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs).to(cpu_device)
-                     if gpu_device != cpu_device:
-                          print(f"  Moving FP16 baseline to GPU ({gpu_device})...");
-                          try: model.to(gpu_device); print("  Model moved to GPU.")
-                          except Exception as e: print(f"ERROR moving FP16 baseline to GPU: {e}"); raise
-                else: # BnB
-                     model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
-                     print(f"BnB model loaded. Device map: {model.hf_device_map if hasattr(model, 'hf_device_map') else 'N/A'}")
+                     if gpu_device != cpu_device: print(f"  Moving FP16 baseline model to GPU..."); model.to(gpu_device); print("  Model moved to GPU.")
+                else: model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs); print(f"BnB model loaded. Device map: {getattr(model, 'hf_device_map', 'N/A')}")
             except Exception as e: print(f"ERROR loading baseline: {e}"); traceback.print_exc(); return 1
 
-        model.eval()
+        model.eval() # Set eval mode
 
+        # === REMOVED Manual Move Block ===
+        # Logic moved into setup_offloading_hooks (for final_ln)
+        # and hook implicitly handles QuantizedLinear lm_head
+
+        # --- Prepare Inputs ---
         inputs = tokenizer(args.prompt, return_tensors="pt")
-        input_device = cpu_device
+        input_device = cpu_device # Default
         if args.use_bnb_4bit:
              try: input_device = next(model.parameters()).device
-             except Exception: print("Warning: BnB device unknown, input->CPU."); input_device = cpu_device
-        elif not args.use_hf_baseline and use_cpu_offload: input_device = cpu_device
-        elif gpu_device != cpu_device: input_device = gpu_device
+             except Exception: print("Warn: BnB device unknown, input->CPU."); input_device = cpu_device
+        elif not args.use_hf_baseline and use_cpu_offload: input_device = cpu_device # Atlas offload: input->CPU
+        elif gpu_device != cpu_device: input_device = gpu_device # Atlas/FP16 full GPU: input->GPU
         print(f"\nPlacing initial inputs on device: {input_device}")
-        input_ids = inputs.input_ids.to(input_device)
-        attention_mask = inputs.attention_mask.to(input_device)
+        input_ids = inputs.input_ids.to(input_device); attention_mask = inputs.attention_mask.to(input_device)
         start_len = input_ids.shape[1]
 
+        # --- Generation ---
         print(f"\n--- Generating {args.max_new_tokens} tokens ---")
         print(f"Prompt: '{args.prompt}'")
         print(f"Using {'Sampling (T='+str(args.temperature)+', K='+str(args.top_k)+')' if args.do_sample else 'Greedy'} decoding.")
         output_sequences = None; total_time = 0.0; start_time = time.time()
-        generate_kwargs = {"max_new_tokens": args.max_new_tokens, "pad_token_id": tokenizer.pad_token_id, "eos_token_id": tokenizer.eos_token_id, **({"do_sample": True, "temperature": args.temperature, "top_k": args.top_k} if args.do_sample else {"do_sample": False})}
+        generate_kwargs = { "max_new_tokens": args.max_new_tokens, "pad_token_id": tokenizer.pad_token_id, "eos_token_id": tokenizer.eos_token_id,
+                            **({"do_sample": True, "temperature": args.temperature, "top_k": args.top_k} if args.do_sample else {"do_sample": False}),}
         if not args.use_hf_baseline and not args.use_bnb_4bit: generate_kwargs["use_cache"] = True
         if args.profile_memory: profile_memory_usage(0, log_prefix="Pre-Gen")
         print("Starting generation...")
         try:
-            with torch.no_grad():
-                output_sequences = model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
-            total_time = time.time() - start_time
-            print("\nGeneration finished.")
-        except Exception as e:
-            print(f"\n!!! ERROR during model.generate(): {e} !!!"); traceback.print_exc()
-            output_sequences = input_ids
-        if args.profile_memory: profile_memory_usage(args.max_new_tokens, log_prefix="Post-Gen")
-        print()
+            with torch.no_grad(): output_sequences = model.generate(input_ids=input_ids, attention_mask=attention_mask, **generate_kwargs)
+            total_time = time.time() - start_time; print("\nGeneration finished.")
+        except Exception as e: print(f"\n!!! ERROR during model.generate(): {e} !!!"); traceback.print_exc(); output_sequences = input_ids
+        if args.profile_memory: profile_memory_usage(args.max_new_tokens, log_prefix="Post-Gen"); print()
 
+        # --- Decode and Print Results ---
         if output_sequences is not None:
             if isinstance(output_sequences, list): generated_ids = output_sequences[0]
             elif isinstance(output_sequences, torch.Tensor): generated_ids = output_sequences[0]
-            else: print("Warning: Unexpected output type"); generated_ids = input_ids
+            else: print("Warn: Unexpected output type"); generated_ids = input_ids
             num_generated = len(generated_ids) - start_len; total_time = max(total_time, 1e-6); tokens_per_sec = num_generated / total_time if num_generated > 0 else 0
-            print("\n--- Generation Results ---")
-            final_output = tokenizer.decode(generated_ids.cpu(), skip_special_tokens=True)
-            print(f"\nOutput:\n{final_output}")
-            print("-" * 20); print(f"Time taken: {total_time:.2f} seconds"); print(f"Tokens generated: {num_generated}"); print(f"Throughput: {tokens_per_sec:.2f} tokens/sec")
+            print("\n--- Generation Results ---"); final_output = tokenizer.decode(generated_ids.cpu(), skip_special_tokens=True)
+            print(f"\nOutput:\n{final_output}"); print("-" * 20); print(f"Time taken: {total_time:.2f} seconds")
+            print(f"Tokens generated: {num_generated}"); print(f"Throughput: {tokens_per_sec:.2f} tokens/sec")
         else: print("\n--- Generation Failed ---")
 
+        # --- Print Cache Stats ---
         if not args.use_hf_baseline and not args.use_bnb_4bit and memory_manager:
-            print("\n--- Memory Manager Stats ---"); stats = memory_manager.get_stats();
+            print("\n--- Memory Manager Stats ---"); stats = memory_manager.get_stats()
             for key, value in stats.items(): print(f"  {key}: {value}")
 
-    finally:
+    finally: # Cleanup
         print("\nCleaning up resources...")
         if 'model' in locals() and model is not None: del model
         if 'memory_manager' in locals() and memory_manager is not None: memory_manager.close(); del memory_manager
-        cleanup_memory()
-        print("Cleanup Done.")
+        cleanup_memory(); print("Cleanup Done.")
 
 if __name__ == "__main__":
     try: main()
