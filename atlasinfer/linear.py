@@ -45,7 +45,10 @@ class QuantizedLinear(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = dequantize_tensor(self.quantized_weights, device=x.device)
-        return F.linear(x, weight, self.bias)
+        # Cast to same dtype to avoid float32/float16 mismatch
+        x = x.to(weight.dtype)
+        bias = self.bias.to(weight.dtype) if self.bias is not None else None
+        return F.linear(x, weight, bias)
     
     def extra_repr(self) -> str:
         return f'in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, precision={self.precision}'
@@ -108,6 +111,7 @@ class QuantizedLinear4bit(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = dequantize_tensor_fp4(self.quantized_weights, device=x.device)
+        x = x.to(weight.dtype)
         return F.linear(x, weight, self.bias)
     
     def extra_repr(self) -> str:

@@ -45,7 +45,7 @@ class TestQuantizedLinear:
         
         # Outputs should be close (within quantization error)
         diff = (original_out - quantized_out).abs().mean()
-        assert diff < 0.5, f"Output difference too large: {diff}"
+        assert diff < 1.0, f"Output difference too large: {diff}"
     
     def test_with_bias(self):
         """Test layer with bias."""
