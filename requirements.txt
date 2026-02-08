@@ -1,0 +1,13 @@
+# AtlasInfer Dependencies
+
+# Core ML
+torch>=2.0.0
+numpy
+
+# LLM Framework
+transformers>=4.30.0
+accelerate>=0.20.0
+safetensors
+
+# Testing (dev)
+pytest>=7.0.0
