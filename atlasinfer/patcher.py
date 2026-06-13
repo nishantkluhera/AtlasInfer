@@ -1,284 +1,218 @@
 """
-AtlasInfer Model Patcher - Non-invasive model modification utilities
+AtlasInfer Model Patcher - replace dense linear layers with quantized ones.
+
+Handles both ``nn.Linear`` and HuggingFace ``Conv1D`` (GPT-2 family) and supports
+two modes:
+
+* ``quantize_model`` - uniform precision for every layer (the simple baseline).
+* ``quantize_model_mixed`` - per-layer precision from an allocation dict (the
+  mixed-precision path that spends a memory budget where it matters most).
 """
+import gc
+from typing import Dict, List, Optional
+
 import torch
 import torch.nn as nn
-from typing import List, Optional, Set, Dict
-import gc
 
-from .quantizer import quantize_tensor
 from .linear import QuantizedLinear, QuantizedLinear4bit, create_quantized_linear
+
+DEFAULT_EXCLUDE = ["embed", "lm_head", "norm", "ln_", "layernorm"]
+
+
+def _is_linear_layer(module: nn.Module) -> bool:
+    """True for nn.Linear and HuggingFace Conv1D layers."""
+    if isinstance(module, nn.Linear):
+        return True
+    return type(module).__name__ == "Conv1D"
+
+
+def _dense_bytes(module: nn.Module) -> int:
+    n = module.weight.numel()
+    if getattr(module, "bias", None) is not None:
+        n += module.bias.numel()
+    return n * module.weight.element_size()
+
+
+def _quantized_bytes(layer: nn.Module, fallback: int) -> int:
+    if hasattr(layer, "quantized_weights"):
+        b = layer.quantized_weights.memory_bytes()
+        if getattr(layer, "bias", None) is not None:
+            b += layer.bias.numel() * layer.bias.element_size()
+        return b
+    if hasattr(layer, "memory_bytes"):  # W8A16Linear (kernel path)
+        return layer.memory_bytes()
+    return fallback  # fp16: kept dense
+
+
+def _collect_targets(
+    model: nn.Module, exclude_patterns: List[str]
+) -> List[tuple]:
+    """Return (parent, attr_name, module, full_name) for each quantizable layer."""
+    targets = []
+    for name, module in model.named_modules():
+        if not _is_linear_layer(module):
+            continue
+        if any(pat.lower() in name.lower() for pat in exclude_patterns):
+            continue
+        parts = name.rsplit(".", 1)
+        if len(parts) == 1:
+            parent, attr = model, parts[0]
+        else:
+            parent, attr = model.get_submodule(parts[0]), parts[1]
+        targets.append((parent, attr, module, name))
+    return targets
 
 
 def quantize_model(
     model: nn.Module,
+    precision: str = "int8",
     exclude_patterns: Optional[List[str]] = None,
-    block_size: int = 128,
-    outlier_threshold: float = 3.0,
-    verbose: bool = True
+    verbose: bool = True,
+    use_kernel: bool = False,
 ) -> nn.Module:
-    """
-    Quantize all Linear layers in a model in-place (uniform FP8).
-    
-    This replaces nn.Linear layers with QuantizedLinear, reducing memory
-    footprint while preserving accuracy through outlier detection.
-    
+    """Quantize every eligible linear layer to a single uniform precision."""
+    return quantize_model_mixed(
+        model,
+        allocation=None,
+        default_precision=precision,
+        exclude_patterns=exclude_patterns,
+        verbose=verbose,
+        use_kernel=use_kernel,
+    )
+
+
+def quantize_model_mixed(
+    model: nn.Module,
+    allocation: Optional[Dict[str, str]],
+    default_precision: str = "int8",
+    exclude_patterns: Optional[List[str]] = None,
+    verbose: bool = True,
+    use_kernel: bool = False,
+) -> nn.Module:
+    """Replace linear layers in-place using a per-layer precision allocation.
+
     Args:
-        model: Model to quantize (should be on CPU)
-        exclude_patterns: Layer name patterns to exclude (default: embeddings, lm_head, norms)
-        block_size: Block size for quantization
-        outlier_threshold: Z-score threshold for outlier detection
-        verbose: Print progress information
-        
-    Returns:
-        The model with quantized layers (modified in-place)
+        model: Model to quantize (typically on CPU before this call).
+        allocation: ``layer_name -> precision`` ("fp16"/"int8"/"int4"). Layers
+            absent from the dict fall back to ``default_precision``. If
+            ``allocation`` is None, every layer uses ``default_precision``.
+        default_precision: Precision for layers not present in ``allocation``.
+        exclude_patterns: Name substrings to skip (defaults to embeddings,
+            norms, lm_head).
     """
     if exclude_patterns is None:
-        exclude_patterns = [
-            'embed',      # Embedding layers (embed_tokens, embeddings, etc.)
-            'lm_head',    # Output head
-            'norm',       # Layer norms
-            'ln_',        # Layer norms (GPT-2 style)
-            'layernorm',  # Layer norms
-        ]
-    
-    layers_quantized = 0
-    layers_skipped = 0
+        exclude_patterns = DEFAULT_EXCLUDE
+    allocation = allocation or {}
+
+    targets = _collect_targets(model, exclude_patterns)
+    stats = {"fp16": 0, "int8": 0, "int4": 0}
     original_size = 0
     quantized_size = 0
-    
-    # Collect layers to replace (can't modify during iteration)
-    replacements = []
-    
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear):
-            continue
-            
-        # Check exclusion patterns
-        name_lower = name.lower()
-        should_exclude = any(pattern.lower() in name_lower for pattern in exclude_patterns)
-        
-        if should_exclude:
-            layers_skipped += 1
-            continue
-        
-        # Find parent module and attribute name
-        parts = name.rsplit('.', 1)
-        if len(parts) == 1:
-            parent = model
-            attr_name = parts[0]
-        else:
-            parent_name, attr_name = parts
-            parent = model.get_submodule(parent_name)
-        
-        replacements.append((parent, attr_name, module, name))
-    
-    # Perform replacements
-    for parent, attr_name, linear_module, full_name in replacements:
-        # Calculate original size
-        orig_bytes = linear_module.weight.numel() * linear_module.weight.element_size()
-        if linear_module.bias is not None:
-            orig_bytes += linear_module.bias.numel() * linear_module.bias.element_size()
+
+    for parent, attr, module, full_name in targets:
+        precision = allocation.get(full_name, default_precision).lower()
+        precision = {"fp8": "int8", "fp4": "int4"}.get(precision, precision)
+
+        orig_bytes = _dense_bytes(module)
         original_size += orig_bytes
-        
-        # Create quantized replacement
-        quantized_linear = QuantizedLinear.from_linear(
-            linear_module,
-            block_size=block_size,
-            outlier_threshold=outlier_threshold
+
+        new_layer = create_quantized_linear(
+            module, precision=precision, use_kernel=use_kernel
         )
-        
-        # Calculate quantized size
-        quant_bytes = quantized_linear.quantized_weights.memory_bytes()
-        if quantized_linear.bias is not None:
-            quant_bytes += quantized_linear.bias.numel() * quantized_linear.bias.element_size()
-        quantized_size += quant_bytes
-        
-        # Replace in model
-        setattr(parent, attr_name, quantized_linear)
-        
-        # Clean up old module
-        del linear_module
-        layers_quantized += 1
-    
-    # Force garbage collection
+        quantized_size += _quantized_bytes(new_layer, orig_bytes)
+
+        setattr(parent, attr, new_layer)
+        del module
+        stats[precision] = stats.get(precision, 0) + 1
+
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
+
     if verbose:
-        ratio = original_size / quantized_size if quantized_size > 0 else float('inf')
-        print(f"Quantization complete:")
-        print(f"  Layers quantized: {layers_quantized}")
-        print(f"  Layers skipped: {layers_skipped}")
-        print(f"  Original size: {original_size / (1024**2):.1f} MB")
-        print(f"  Quantized size: {quantized_size / (1024**2):.1f} MB")
-        print(f"  Compression ratio: {ratio:.2f}x")
-    
+        ratio = original_size / quantized_size if quantized_size > 0 else 1.0
+        mode = "uniform" if not allocation else "mixed-precision"
+        print(f"Quantization complete ({mode}):")
+        print(f"  FP16: {stats['fp16']}  INT8: {stats['int8']}  INT4: {stats['int4']} layers")
+        print(f"  {original_size / 1024**2:.1f} MB -> {quantized_size / 1024**2:.1f} MB "
+              f"({ratio:.2f}x smaller)")
+
     return model
 
 
+# Backwards-compatible alias for the previous public name.
 def quantize_model_ladq(
     model: nn.Module,
     precision_allocation: Dict[str, str],
     exclude_patterns: Optional[List[str]] = None,
-    verbose: bool = True
+    verbose: bool = True,
 ) -> nn.Module:
-    """
-    Apply LADQ mixed-precision quantization based on allocation.
-    
-    This is the NOVEL CONTRIBUTION of AtlasInfer: each layer gets
-    precision (FP16/FP8/FP4) based on its sensitivity score.
-    
-    Args:
-        model: Model to quantize (should be on CPU)
-        precision_allocation: Dict mapping layer names to precision strings
-        exclude_patterns: Additional patterns to exclude
-        verbose: Print progress
-        
-    Returns:
-        Model with mixed-precision quantized layers
-    """
-    if exclude_patterns is None:
-        exclude_patterns = ['embed', 'lm_head', 'norm', 'ln_', 'layernorm']
-    
-    stats = {'fp16': 0, 'fp8': 0, 'fp4': 0, 'skipped': 0}
-    original_size = 0
-    quantized_size = 0
-    
-    replacements = []
-    
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear):
-            continue
-        
-        name_lower = name.lower()
-        if any(pat.lower() in name_lower for pat in exclude_patterns):
-            stats['skipped'] += 1
-            continue
-        
-        parts = name.rsplit('.', 1)
-        if len(parts) == 1:
-            parent = model
-            attr_name = parts[0]
-        else:
-            parent_name, attr_name = parts
-            parent = model.get_submodule(parent_name)
-        
-        # Get precision from allocation (default to FP8)
-        precision = precision_allocation.get(name, 'fp8').lower()
-        
-        replacements.append((parent, attr_name, module, name, precision))
-    
-    for parent, attr_name, linear_module, full_name, precision in replacements:
-        orig_bytes = linear_module.weight.numel() * linear_module.weight.element_size()
-        if linear_module.bias is not None:
-            orig_bytes += linear_module.bias.numel() * linear_module.bias.element_size()
-        original_size += orig_bytes
-        
-        # Create appropriate quantized layer
-        new_layer = create_quantized_linear(linear_module, precision=precision)
-        
-        # Calculate new size
-        if precision == 'fp16':
-            quant_bytes = orig_bytes
-        elif hasattr(new_layer, 'quantized_weights'):
-            quant_bytes = new_layer.quantized_weights.memory_bytes()
-            if new_layer.bias is not None:
-                quant_bytes += new_layer.bias.numel() * new_layer.bias.element_size()
-        else:
-            quant_bytes = orig_bytes
-        
-        quantized_size += quant_bytes
-        
-        setattr(parent, attr_name, new_layer)
-        del linear_module
-        stats[precision] += 1
-    
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    if verbose:
-        ratio = original_size / quantized_size if quantized_size > 0 else 1.0
-        print(f"LADQ Mixed-Precision Quantization:")
-        print(f"  FP16 (high precision): {stats['fp16']} layers")
-        print(f"  FP8 (medium precision): {stats['fp8']} layers")
-        print(f"  FP4 (low precision): {stats['fp4']} layers")
-        print(f"  Skipped: {stats['skipped']} layers")
-        print(f"  Original: {original_size / (1024**2):.1f} MB → Quantized: {quantized_size / (1024**2):.1f} MB")
-        print(f"  Compression: {ratio:.2f}x")
-    
-    return model
+    return quantize_model_mixed(
+        model,
+        allocation=precision_allocation,
+        exclude_patterns=exclude_patterns,
+        verbose=verbose,
+    )
 
 
 def get_model_info(model: nn.Module) -> dict:
-    """
-    Get information about model layers and their types.
-    
-    Returns:
-        Dictionary with counts and lists of layer types
-    """
+    """Counts of dense vs quantized linear layers in the model."""
+    from .triton_kernels import W8A16Linear, W4A16Linear
+
     info = {
-        'total_modules': 0,
-        'linear_count': 0,
-        'quantized_linear_count': 0,
-        'quantized_linear_4bit_count': 0,
-        'other_count': 0,
-        'linear_names': [],
-        'quantized_names': [],
+        "total_modules": 0,
+        "linear_count": 0,
+        "quantized_linear_count": 0,
+        "quantized_linear_4bit_count": 0,
+        "w8a16_kernel_count": 0,
+        "w4a16_kernel_count": 0,
+        "other_count": 0,
+        "linear_names": [],
+        "quantized_names": [],
     }
-    
     for name, module in model.named_modules():
-        info['total_modules'] += 1
-        
+        info["total_modules"] += 1
         if isinstance(module, QuantizedLinear4bit):
-            info['quantized_linear_4bit_count'] += 1
-            info['quantized_names'].append(name)
+            info["quantized_linear_4bit_count"] += 1
+            info["quantized_names"].append(name)
+        elif isinstance(module, W8A16Linear):
+            info["w8a16_kernel_count"] += 1
+            info["quantized_names"].append(name)
+        elif isinstance(module, W4A16Linear):
+            info["w4a16_kernel_count"] += 1
+            info["quantized_names"].append(name)
         elif isinstance(module, QuantizedLinear):
-            info['quantized_linear_count'] += 1
-            info['quantized_names'].append(name)
+            info["quantized_linear_count"] += 1
+            info["quantized_names"].append(name)
         elif isinstance(module, nn.Linear):
-            info['linear_count'] += 1
-            info['linear_names'].append(name)
+            info["linear_count"] += 1
+            info["linear_names"].append(name)
         else:
-            info['other_count'] += 1
-    
+            info["other_count"] += 1
     return info
 
 
 def find_decoder_layers(model: nn.Module) -> Optional[nn.ModuleList]:
-    """
-    Find the decoder layer list in a model.
-    
-    Tries common patterns for popular model architectures.
-    
-    Returns:
-        ModuleList of decoder layers, or None if not found
-    """
+    """Locate a model's decoder layer ModuleList across common architectures."""
     patterns = [
-        'model.layers',           # Llama, Mistral, Gemma
-        'model.decoder.layers',   # OPT
-        'transformer.h',          # GPT-2, GPT-J
-        'gpt_neox.layers',        # GPT-NeoX, Pythia
+        "model.layers",          # Llama, Mistral, Gemma
+        "model.decoder.layers",  # OPT
+        "transformer.h",         # GPT-2, GPT-J
+        "gpt_neox.layers",       # GPT-NeoX, Pythia
     ]
-    
     for pattern in patterns:
         try:
             obj = model
-            for attr in pattern.split('.'):
+            for attr in pattern.split("."):
                 obj = getattr(obj, attr)
             if isinstance(obj, (nn.ModuleList, list)):
                 return obj
         except AttributeError:
             continue
-    
     return None
 
 
 def get_model_dtype(model: nn.Module) -> torch.dtype:
-    """Get the primary dtype of model parameters."""
     for param in model.parameters():
         return param.dtype
     return torch.float32
-

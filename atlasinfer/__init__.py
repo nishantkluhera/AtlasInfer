@@ -1,37 +1,66 @@
 """
-AtlasInfer - Efficient LLM Inference with Layer-Adaptive Dynamic Quantization (LADQ)
+AtlasInfer - mixed-precision LLM inference for consumer GPUs.
 
-Novel features:
-- Sensitivity-based precision allocation (FP16/FP8/FP4)
-- Memory-budget-aware quantization
-- CPU offloading for large models
+Quantizes each linear layer to FP16 / INT8 / INT4 based on its *measured*
+sensitivity to quantization, spending a memory budget where it buys the most
+accuracy. The precision assignment is solved exactly as a budget-constrained
+knapsack over a per-layer error-vs-memory frontier.
+
+Pipeline:
+    1. quantizer  - block-wise INT8/INT4 with FP16 outlier preservation
+    2. sensitivity - per-layer, per-bit-width error on real calibration activations
+    3. allocator  - exact (DP) precision assignment within a memory budget
+    4. patcher    - swap dense layers for quantized ones in-place
 """
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 from .quantizer import (
     quantize_tensor, dequantize_tensor, QuantizedTensor,
-    quantize_tensor_fp4, dequantize_tensor_fp4, QuantizedTensor4bit
+    quantize_tensor_fp4, dequantize_tensor_fp4, QuantizedTensor4bit,
+    compression_ratio,
 )
 from .linear import QuantizedLinear, QuantizedLinear4bit, create_quantized_linear
-from .patcher import quantize_model, quantize_model_ladq, get_model_info
-from .offload import setup_cpu_offload, CPUOffloadHook
-from .sensitivity import LayerSensitivityProfiler, compute_sensitivity_scores
-from .allocator import PrecisionAllocator, PrecisionLevel, get_layer_sizes
+from .patcher import (
+    quantize_model, quantize_model_mixed, quantize_model_ladq, get_model_info,
+)
+from .offload import setup_cpu_offload, CPUOffloadHook, estimate_model_memory
+from .sensitivity import (
+    SensitivityProfiler, LayerSensitivityProfiler, LayerProfile,
+    compute_sensitivity_scores, get_cache_path, print_sensitivity_report,
+)
+from .allocator import (
+    PrecisionLevel, AllocationResult, get_layer_sizes,
+    allocate_optimal, allocate_greedy, uniform_allocation,
+    estimate_memory_usage, print_allocation_report, PrecisionAllocator,
+)
+from .triton_kernels import (
+    HAS_TRITON, kernel_available, W8A16Linear, W4A16Linear,
+    quantize_w8a16, quantize_w4a16,
+)
 from .inference import AtlasInference
 
 __all__ = [
-    # Core quantization
+    # Quantization primitives
     "quantize_tensor", "dequantize_tensor", "QuantizedTensor",
     "quantize_tensor_fp4", "dequantize_tensor_fp4", "QuantizedTensor4bit",
+    "compression_ratio",
     # Layers
     "QuantizedLinear", "QuantizedLinear4bit", "create_quantized_linear",
-    # Model patching
-    "quantize_model", "quantize_model_ladq", "get_model_info",
+    # Patching
+    "quantize_model", "quantize_model_mixed", "quantize_model_ladq",
+    "get_model_info",
     # Offloading
-    "setup_cpu_offload", "CPUOffloadHook",
-    # LADQ (Novel)
-    "LayerSensitivityProfiler", "compute_sensitivity_scores",
-    "PrecisionAllocator", "PrecisionLevel", "get_layer_sizes",
+    "setup_cpu_offload", "CPUOffloadHook", "estimate_model_memory",
+    # Sensitivity profiling
+    "SensitivityProfiler", "LayerSensitivityProfiler", "LayerProfile",
+    "compute_sensitivity_scores", "get_cache_path", "print_sensitivity_report",
+    # Allocation
+    "PrecisionLevel", "AllocationResult", "get_layer_sizes",
+    "allocate_optimal", "allocate_greedy", "uniform_allocation",
+    "estimate_memory_usage", "print_allocation_report", "PrecisionAllocator",
+    # Fused kernel
+    "HAS_TRITON", "kernel_available", "W8A16Linear", "W4A16Linear",
+    "quantize_w8a16", "quantize_w4a16",
     # Inference
     "AtlasInference",
 ]

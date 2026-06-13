@@ -1,13 +1,17 @@
-# AtlasInfer Dependencies
+# AtlasInfer dependencies
 
-# Core ML
+# Core
 torch>=2.0.0
 numpy
 
-# LLM Framework
+# Model loading
 transformers>=4.30.0
 accelerate>=0.20.0
 safetensors
+
+# Benchmarking (optional - only needed for benchmark.py)
+datasets
+matplotlib
 
 # Testing (dev)
 pytest>=7.0.0

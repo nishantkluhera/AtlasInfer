@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlasinfer"
+version = "2.1.0"
+description = "Mixed-precision quantization for running LLMs on consumer GPUs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Nishant Luhera" }]
+keywords = ["llm", "quantization", "inference", "mixed-precision", "pytorch"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "numpy",
+    "transformers>=4.30.0",
+    "accelerate>=0.20.0",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+benchmark = ["datasets", "matplotlib"]
+dev = ["pytest>=7.0.0"]
+kernel = ["triton>=3.0"]  # fused W8A16 kernel; Linux/WSL2 only
+
+[project.scripts]
+atlasinfer = "atlasinfer.inference:main"
+
+[tool.setuptools.packages.find]
+include = ["atlasinfer*"]

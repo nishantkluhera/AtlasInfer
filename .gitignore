@@ -175,5 +175,10 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# AtlasInfer
+.atlasinfer_cache/
+results_smoke/
+results_run.log
+
 # PyPI configuration file
 .pypirc

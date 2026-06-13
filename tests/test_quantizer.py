@@ -54,31 +54,46 @@ class TestQuantizer:
         
         # Quantize with low threshold to catch these as outliers
         quantized = quantize_tensor(original, block_size=64, outlier_threshold=2.5)
-        
-        # Should have some outliers
-        num_outliers = quantized.outlier_mask.sum().item()
+
+        # Should have some outliers (stored sparsely as flat indices)
+        num_outliers = quantized.outlier_indices.numel()
         assert num_outliers > 0, "No outliers detected"
-        
+
         # Dequantize
         reconstructed = dequantize_tensor(quantized)
-        
+
         # Outlier values should be exactly preserved
-        outlier_positions = quantized.outlier_mask.nonzero()
-        for pos in outlier_positions[:min(10, len(outlier_positions))]:  # Check first 10
-            orig_val = original[tuple(pos)].item()
-            recon_val = reconstructed[tuple(pos)].item()
-            assert abs(orig_val - recon_val) < 1e-3, f"Outlier not preserved at {pos}"
+        recon_flat = reconstructed.reshape(-1)
+        orig_flat = original.reshape(-1)
+        for idx in quantized.outlier_indices[:min(10, num_outliers)].long():
+            orig_val = orig_flat[idx].item()
+            recon_val = recon_flat[idx].item()
+            assert abs(orig_val - recon_val) < 1e-3, f"Outlier not preserved at {idx}"
     
     def test_compression_ratio(self):
-        """Verify we achieve meaningful compression."""
+        """INT8 with sparse outliers must actually shrink the tensor.
+
+        Regression guard: a dense boolean outlier mask used to cost a full byte
+        per weight, making the 'quantized' tensor as big as (or bigger than) the
+        FP16 original. With sparse outliers INT8 should be ~1.7x+ smaller.
+        """
         original = torch.randn(1024, 1024, dtype=torch.float16)
         quantized = quantize_tensor(original)
-        
+
         ratio = compression_ratio(original, quantized)
-        
-        # FP8 + outliers + scales may not compress much on random data
-        # Just verify ratio is calculated and positive
-        assert ratio > 0.5, f"Compression ratio too low: {ratio}"
+        assert ratio > 1.5, f"INT8 compression ratio too low: {ratio}"
+
+    def test_int4_compression_ratio(self):
+        """INT4 should compress more aggressively than INT8."""
+        from atlasinfer.quantizer import quantize_tensor_fp4, QuantizedTensor4bit
+
+        original = torch.randn(1024, 1024, dtype=torch.float16)
+        q4 = quantize_tensor_fp4(original)
+        assert isinstance(q4, QuantizedTensor4bit)
+
+        orig_bytes = original.numel() * original.element_size()
+        ratio = orig_bytes / q4.memory_bytes()
+        assert ratio > 3.0, f"INT4 compression ratio too low: {ratio}"
     
     def test_small_tensor(self):
         """Test with tensor smaller than block size."""

@@ -7,12 +7,12 @@ import time
 import sys
 import gc
 from typing import Optional
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from .patcher import quantize_model, quantize_model_ladq, get_model_info
+from .patcher import quantize_model, quantize_model_mixed
 from .offload import setup_cpu_offload, estimate_model_memory
-from .sensitivity import compute_sensitivity_scores
-from .allocator import PrecisionAllocator, PrecisionLevel, get_layer_sizes
+from .sensitivity import SensitivityProfiler
+from .allocator import allocate_optimal, print_allocation_report
 
 
 class AtlasInference:
@@ -34,11 +34,12 @@ class AtlasInference:
         block_size: int = 128,
         outlier_threshold: float = 3.0,
         device: Optional[str] = None,
+        kernel: str = "auto",
         verbose: bool = True
     ):
         """
         Initialize the inference engine.
-        
+
         Args:
             model_name: HuggingFace model name or path
             quantize: Whether to apply quantization
@@ -47,19 +48,32 @@ class AtlasInference:
             block_size: Block size for quantization
             outlier_threshold: Z-score threshold for outlier detection
             device: Target device ('cuda', 'cpu', or None for auto)
+            kernel: use the fused INT8 Triton kernel for INT8 layers -
+                "auto" (on when Triton + CUDA are available), "on", or "off".
             verbose: Print loading progress
         """
         self.model_name = model_name
         self.verbose = verbose
-        
+
         # Determine device
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = torch.device(device)
-        
+
+        # Resolve whether INT8 layers use the fused kernel (W8A16Linear).
+        from .triton_kernels import kernel_available
+        if kernel == "on":
+            self.use_kernel = True
+        elif kernel == "off":
+            self.use_kernel = False
+        else:  # auto
+            self.use_kernel = kernel_available() and self.device.type == "cuda"
+
         self._log(f"Loading model: {model_name}")
         self._log(f"Device: {self.device}")
+        if self.use_kernel:
+            self._log("Fused Triton kernels: ENABLED for INT8/INT4 layers")
         
         # Load tokenizer
         self._log("Loading tokenizer...")
@@ -84,24 +98,23 @@ class AtlasInference:
         # Apply quantization
         if quantize:
             if memory_budget_gb is not None:
-                # LADQ: Layer-Adaptive Dynamic Quantization (NOVEL)
-                self._log(f"Applying LADQ with {memory_budget_gb:.1f} GB budget...")
-                self._apply_ladq(memory_budget_gb, verbose)
+                # Mixed-precision: spend the budget where it buys most accuracy.
+                self._log(f"Applying mixed-precision quantization with "
+                          f"{memory_budget_gb:.1f} GB budget...")
+                self._apply_mixed_precision(memory_budget_gb, verbose)
             else:
-                # Uniform FP8 quantization
-                self._log("Applying uniform FP8 quantization...")
-                quantize_model(
-                    self.model,
-                    block_size=block_size,
-                    outlier_threshold=outlier_threshold,
-                    verbose=verbose
-                )
+                # Uniform INT8 quantization.
+                self._log("Applying uniform INT8 quantization...")
+                quantize_model(self.model, precision="int8", verbose=verbose,
+                               use_kernel=self.use_kernel)
             self._cleanup_memory()
         
         # Setup CPU offload or move to GPU
+        self.offloaded = False
         if cpu_offload and self.device.type == 'cuda':
             self._log("Setting up CPU offloading...")
             setup_cpu_offload(self.model, self.device)
+            self.offloaded = True
             self._log("Model stays on CPU, layers move to GPU during forward pass")
         elif self.device.type == 'cuda':
             self._log(f"Moving model to {self.device}...")
@@ -143,16 +156,18 @@ class AtlasInference:
         # Tokenize
         inputs = self.tokenizer(prompt, return_tensors="pt")
         
-        # Move inputs to appropriate device
-        if hasattr(self.model, '_hf_hook'):
-            # CPU offload mode - inputs stay on CPU
-            input_device = torch.device('cpu')
-        else:
-            input_device = self.device
-        
+        # In offload mode the model lives on CPU (blocks stream to the GPU during
+        # the forward pass), so inputs must start on CPU.
+        input_device = torch.device('cpu') if self.offloaded else self.device
+
         input_ids = inputs.input_ids.to(input_device)
         attention_mask = inputs.attention_mask.to(input_device)
-        
+
+        # KV-cache tensors created on the GPU don't survive a block being evicted
+        # back to CPU, so disable the cache when offloading.
+        if self.offloaded:
+            kwargs.setdefault('use_cache', False)
+
         # Generate
         generate_kwargs = {
             'max_new_tokens': max_tokens,
@@ -181,44 +196,40 @@ class AtlasInference:
         output_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         return output_text
     
-    def _apply_ladq(self, memory_budget_gb: float, verbose: bool) -> None:
+    def _apply_mixed_precision(self, memory_budget_gb: float, verbose: bool) -> None:
+        """Profile -> allocate -> quantize at mixed precision within a budget.
+
+        1. Measure each layer's INT8/INT4 error on real calibration activations.
+        2. Solve the exact budget-constrained precision assignment (DP knapsack).
+        3. Replace layers in-place at their assigned precision.
         """
-        Apply Layer-Adaptive Dynamic Quantization (LADQ).
-        
-        This is the NOVEL contribution of AtlasInfer:
-        1. Profile layer sensitivities
-        2. Allocate precision within budget
-        3. Apply mixed-precision quantization
-        """
-        self._log("Step 1/3: Profiling layer sensitivities...")
-        sensitivities = compute_sensitivity_scores(
-            self.model,
-            cache_path=f".atlasinfer_cache/{self.model_name.replace('/', '_')}_sensitivity.json"
-        )
-        
-        self._log("Step 2/3: Allocating precision within budget...")
-        layer_sizes = get_layer_sizes(self.model)
-        allocator = PrecisionAllocator()
-        
-        memory_budget_bytes = int(memory_budget_gb * 1024**3)
-        allocation = allocator.allocate(
-            sensitivities=sensitivities,
-            layer_sizes=layer_sizes,
-            memory_budget_bytes=memory_budget_bytes
-        )
-        
+        # Profiling runs hundreds of forward passes, so do it on the GPU when
+        # available, then return the model to CPU for in-place quantization
+        # (and any subsequent offload setup).
+        self._log("Step 1/3: Profiling layer sensitivities end-to-end...")
+        if self.device.type == 'cuda':
+            self.model.to(self.device)
+        profiler = SensitivityProfiler()
+        profiles = profiler.profile_end_to_end(self.model, tokenizer=self.tokenizer)
+        if self.device.type == 'cuda':
+            self.model.to('cpu')
+            self._cleanup_memory()
+
+        self._log("Step 2/3: Allocating precision within budget (exact DP)...")
+        memory_budget_bytes = int(memory_budget_gb * 1024 ** 3)
+        allocation = allocate_optimal(profiles, budget_bytes=memory_budget_bytes)
+
         if verbose:
+            sensitivities = {n: p.sensitivity() for n, p in profiles.items()}
             print(f"  {allocation.summary()}")
-        
+            print_allocation_report(allocation, sensitivities, top_n=10)
+
         self._log("Step 3/3: Applying mixed-precision quantization...")
-        # Convert PrecisionLevel enum to strings
-        precision_dict = {
-            name: level.value for name, level in allocation.allocations.items()
-        }
-        quantize_model_ladq(
+        quantize_model_mixed(
             self.model,
-            precision_allocation=precision_dict,
-            verbose=verbose
+            allocation=allocation.allocations,
+            verbose=verbose,
+            use_kernel=self.use_kernel,
         )
     
     def _log(self, message: str) -> None:
@@ -326,11 +337,17 @@ Examples:
         help='Device to use (cuda, cpu, or auto)'
     )
     parser.add_argument(
+        '--kernel',
+        choices=['auto', 'on', 'off'],
+        default='auto',
+        help='Use the fused INT8 Triton kernel for INT8 layers (Linux/WSL2)'
+    )
+    parser.add_argument(
         '--quiet', '-q',
         action='store_true',
         help='Suppress progress output'
     )
-    
+
     return parser.parse_args()
 
 
@@ -352,6 +369,7 @@ def main():
             block_size=args.block_size,
             outlier_threshold=args.outlier_threshold,
             device=args.device,
+            kernel=args.kernel,
             verbose=not args.quiet
         )
         
