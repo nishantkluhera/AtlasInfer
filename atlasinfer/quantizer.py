@@ -27,6 +27,18 @@ INT4_MAX = 7.0
 FP8_MAX, FP8_MIN = INT8_MAX, -INT8_MAX
 FP4_MAX, FP4_MIN = INT4_MAX, -INT4_MAX
 
+# NF4 (NormalFloat-4, from QLoRA): 16 levels placed at the quantiles of a unit
+# normal distribution, normalized to [-1, 1] with an exact 0. Because LLM weights
+# are roughly Gaussian, a grid matched to that distribution wastes far fewer codes
+# than a uniform [-7,7] grid -> lower error at the same 4 bits.
+NF4_LEVELS = torch.tensor([
+    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+    0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
+    0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+    0.7229568362236023, 1.0,
+], dtype=torch.float32)
+
 
 class QuantizedTensor(NamedTuple):
     """A tensor quantized to symmetric INT8 with sparse FP16 outliers.
@@ -255,6 +267,96 @@ def dequantize_tensor_fp4(qt: QuantizedTensor4bit, device: Optional[torch.device
     if padded > qt.num_elements:
         unpacked = torch.nn.functional.pad(unpacked, (0, padded - qt.num_elements))
     blocks = unpacked.view(-1, block_size) * scales.view(-1, 1)
+    out = blocks.view(-1)[: qt.num_elements].to(torch.float16)
+
+    if qt.outlier_indices.numel() > 0:
+        out[qt.outlier_indices.to(device).long()] = qt.outlier_values.to(device)
+    return out.view(qt.original_shape)
+
+
+# ============================================================================ #
+# NF4 (NormalFloat-4) - a distribution-matched 4-bit codebook
+# ============================================================================ #
+def quantize_tensor_nf4(
+    tensor: torch.Tensor, block_size: int = 64, outlier_threshold: float = 2.5
+) -> QuantizedTensor4bit:
+    """Quantize to packed NF4 codes with per-block absmax scale and sparse outliers.
+
+    Each weight is normalized by its block's absmax (into [-1, 1]) and mapped to
+    the nearest NF4 level; the 4-bit *code* (0..15) is what gets packed. Reuses
+    :class:`QuantizedTensor4bit` for storage - decode with
+    :func:`dequantize_tensor_nf4` (the codes index the NF4 codebook, not [-7,7]).
+    """
+    num_elements = tensor.numel()
+    dev = tensor.device
+    if num_elements == 0:
+        return QuantizedTensor4bit(
+            torch.empty(0, dtype=torch.int8, device=dev),
+            torch.empty(0, dtype=torch.float32, device=dev),
+            torch.empty(0, dtype=torch.int32, device=dev),
+            torch.empty(0, dtype=torch.float16, device=dev),
+            tensor.shape, block_size, 0,
+        )
+
+    flat = tensor.float().flatten()
+    padded = math.ceil(num_elements / block_size) * block_size
+    if padded > num_elements:
+        flat = torch.nn.functional.pad(flat, (0, padded - num_elements))
+    blocks = flat.view(-1, block_size)
+
+    outlier_blocks = _find_outliers(blocks, outlier_threshold)
+    clean = blocks.clone()
+    clean[outlier_blocks] = 0.0
+    absmax = clean.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+
+    normalized = blocks / absmax
+    boundaries = ((NF4_LEVELS[:-1] + NF4_LEVELS[1:]) / 2).to(blocks.device)
+    codes = torch.bucketize(normalized.reshape(-1), boundaries).clamp_(0, 15).to(torch.uint8)
+    codes = codes[:num_elements]
+
+    outlier_flat = outlier_blocks.view(-1)[:num_elements]
+    oidx = outlier_flat.nonzero(as_tuple=True)[0].to(torch.int32)
+    oval = tensor.flatten()[oidx.long()].to(torch.float16)
+
+    pack_size = math.ceil(num_elements / 2) * 2
+    if pack_size > num_elements:
+        codes = torch.nn.functional.pad(codes, (0, pack_size - num_elements))
+    packed = ((codes[0::2] << 4) | (codes[1::2] & 0x0F)).to(torch.int8)
+
+    return QuantizedTensor4bit(
+        packed_data=packed.to(dev),
+        scales=absmax.squeeze(1).to(dev),
+        outlier_indices=oidx.to(dev),
+        outlier_values=oval.to(dev),
+        original_shape=tensor.shape,
+        block_size=block_size,
+        num_elements=num_elements,
+    )
+
+
+def dequantize_tensor_nf4(qt: QuantizedTensor4bit, device: Optional[torch.device] = None) -> torch.Tensor:
+    """Reconstruct an FP16 tensor from NF4-coded :class:`QuantizedTensor4bit`."""
+    if device is None:
+        device = qt.packed_data.device
+    if qt.num_elements == 0:
+        return torch.empty(qt.original_shape, dtype=torch.float16, device=device)
+
+    packed = qt.packed_data.to(device).to(torch.uint8)
+    scales = qt.scales.to(device)
+
+    high = (packed >> 4) & 0x0F
+    low = packed & 0x0F
+    codes = torch.empty(packed.numel() * 2, dtype=torch.long, device=device)
+    codes[0::2] = high.long()
+    codes[1::2] = low.long()
+    codes = codes[: qt.num_elements]
+    levels = NF4_LEVELS.to(device)[codes]  # codebook lookup
+
+    block_size = qt.block_size
+    padded = math.ceil(qt.num_elements / block_size) * block_size
+    if padded > qt.num_elements:
+        levels = torch.nn.functional.pad(levels, (0, padded - qt.num_elements))
+    blocks = levels.view(-1, block_size) * scales.view(-1, 1)
     out = blocks.view(-1)[: qt.num_elements].to(torch.float16)
 
     if qt.outlier_indices.numel() > 0:

@@ -8,7 +8,7 @@ from atlasinfer import AtlasInference
 
 def main():
     # Uniform INT8 quantization (no memory budget given).
-    engine = AtlasInference("gpt2", quantize=True)
+    engine = AtlasInference("Qwen/Qwen2.5-0.5B", quantize=True)
 
     prompt = "The key idea behind quantization is"
     print(f"\nPrompt: {prompt}")

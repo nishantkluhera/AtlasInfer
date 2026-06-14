@@ -24,7 +24,7 @@ import gc
 import json
 import os
 import time
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import torch
 
@@ -157,8 +157,9 @@ def run(model_name: str, eval_tokens: int, bit_targets: List[float], device: tor
     # 2) Uniform INT8 / INT4
     m = quantize_model(fresh_model(model_name), precision="int8", verbose=False)
     measure("uniform-int8", m, 8.0)
+    # 4-bit defaults to NF4 (the better codebook); see compare_baselines.py.
     m = quantize_model(fresh_model(model_name), precision="int4", verbose=False)
-    measure("uniform-int4", m, 4.0)
+    measure("uniform-nf4", m, 4.0)
 
     # 3) Mixed precision sweep. Profile ONCE, reuse across budgets.
     print("  profiling layer sensitivities end-to-end (once)...")

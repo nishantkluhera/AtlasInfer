@@ -13,8 +13,6 @@ averaged over the captured activations. These per-layer, per-bit-width errors ar
 the input to the precision allocator (see ``allocator.py``), which spends the
 memory budget where it buys the most accuracy.
 """
-import json
-import os
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -325,46 +323,6 @@ class SensitivityProfiler:
         ]
 
 
-def compute_sensitivity_scores(
-    model: nn.Module,
-    calibration_texts: Optional[List[str]] = None,
-    tokenizer=None,
-    precisions: tuple = DEFAULT_PRECISIONS,
-    reference: str = "int4",
-    cache_path: Optional[str] = None,
-) -> Dict[str, float]:
-    """Convenience wrapper returning a single scalar sensitivity per layer.
-
-    The scalar is the relative output error under ``reference`` precision and is
-    consumed by the greedy allocator. Results are cached to ``cache_path`` as
-    full per-precision error tables when provided.
-    """
-    if cache_path and os.path.exists(cache_path):
-        with open(cache_path, "r") as f:
-            cached = json.load(f)
-        print(f"Loaded cached sensitivity scores from {cache_path}")
-        return {name: errs.get(reference, max(errs.values()))
-                for name, errs in cached.items()}
-
-    profiler = SensitivityProfiler(precisions=precisions)
-    print("Profiling layer sensitivities on calibration data...")
-    profiles = profiler.profile(model, tokenizer, calibration_texts)
-
-    if cache_path:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        with open(cache_path, "w") as f:
-            json.dump({n: p.errors for n, p in profiles.items()}, f, indent=2)
-        print(f"Cached sensitivity scores to {cache_path}")
-
-    return {n: p.sensitivity(reference) for n, p in profiles.items()}
-
-
-def get_cache_path(model_name: str) -> str:
-    """Cache path for a model's sensitivity profile."""
-    safe = model_name.replace("/", "_").replace("\\", "_")
-    return f".atlasinfer_cache/{safe}_sensitivity.json"
-
-
 def print_sensitivity_report(sensitivities: Dict[str, float], top_n: int = 10):
     """Print a human-readable ranking of the most sensitive layers."""
     ranked = sorted(sensitivities.items(), key=lambda x: x[1], reverse=True)
@@ -385,7 +343,3 @@ def print_sensitivity_report(sensitivities: Dict[str, float], top_n: int = 10):
         print(f"Most sensitive:  {ranked[0][0]} ({ranked[0][1]:.6f})")
         print(f"Least sensitive: {ranked[-1][0]} ({ranked[-1][1]:.6f})")
     print("=" * 60 + "\n")
-
-
-# Backwards-compatible alias for the previous public class name.
-LayerSensitivityProfiler = SensitivityProfiler

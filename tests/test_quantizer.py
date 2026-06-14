@@ -13,8 +13,47 @@ from atlasinfer.quantizer import (
     quantize_tensor,
     dequantize_tensor,
     QuantizedTensor,
-    compression_ratio
+    compression_ratio,
+    quantize_tensor_nf4,
+    dequantize_tensor_nf4,
+    quantize_tensor_fp4,
+    dequantize_tensor_fp4,
+    NF4_LEVELS,
 )
+
+
+class TestNF4:
+    """NormalFloat-4 codebook quantization."""
+
+    def test_roundtrip(self):
+        torch.manual_seed(0)
+        original = torch.randn(256, 256, dtype=torch.float16)
+        qt = quantize_tensor_nf4(original)
+        recon = dequantize_tensor_nf4(qt)
+        assert recon.shape == original.shape and recon.dtype == torch.float16
+        rel = (original.float() - recon.float()).norm() / original.float().norm()
+        assert rel < 0.15
+
+    def test_beats_symmetric_int4_on_gaussian(self):
+        # The whole point of NF4: lower error than uniform int4 on normal weights.
+        torch.manual_seed(0)
+        w = torch.randn(512, 512, dtype=torch.float16)
+        nf4_err = (w.float() - dequantize_tensor_nf4(quantize_tensor_nf4(w)).float()).norm()
+        int4_err = (w.float() - dequantize_tensor_fp4(quantize_tensor_fp4(w)).float()).norm()
+        assert nf4_err < int4_err
+
+    def test_same_memory_as_int4(self):
+        w = torch.randn(512, 512, dtype=torch.float16)
+        assert quantize_tensor_nf4(w).memory_bytes() == quantize_tensor_fp4(w).memory_bytes()
+
+    def test_levels_sorted_with_zero(self):
+        assert torch.all(NF4_LEVELS[1:] > NF4_LEVELS[:-1])  # strictly ascending
+        assert (NF4_LEVELS == 0.0).any()                     # has an exact zero
+        assert len(NF4_LEVELS) == 16
+
+    def test_empty(self):
+        qt = quantize_tensor_nf4(torch.empty((0, 8), dtype=torch.float16))
+        assert dequantize_tensor_nf4(qt).numel() == 0
 
 
 class TestQuantizer:
@@ -39,7 +78,7 @@ class TestQuantizer:
         assert reconstructed.shape == original.shape
         assert reconstructed.dtype == torch.float16
         
-        # Check accuracy (allow for FP8 quantization error)
+        # Check accuracy (allow for INT8 quantization error)
         mse = torch.mean((original.float() - reconstructed.float()) ** 2)
         assert mse < 2.0, f"MSE too high: {mse.item()}"
     

@@ -16,7 +16,7 @@ from atlasinfer import (
     print_allocation_report,
 )
 
-MODEL = "gpt2"
+MODEL = "Qwen/Qwen2.5-0.5B"
 
 
 def main():

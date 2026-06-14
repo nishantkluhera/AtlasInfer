@@ -69,6 +69,7 @@ def quantize_model(
     exclude_patterns: Optional[List[str]] = None,
     verbose: bool = True,
     use_kernel: bool = False,
+    quant_4bit: str = "nf4",
 ) -> nn.Module:
     """Quantize every eligible linear layer to a single uniform precision."""
     return quantize_model_mixed(
@@ -78,6 +79,7 @@ def quantize_model(
         exclude_patterns=exclude_patterns,
         verbose=verbose,
         use_kernel=use_kernel,
+        quant_4bit=quant_4bit,
     )
 
 
@@ -88,6 +90,7 @@ def quantize_model_mixed(
     exclude_patterns: Optional[List[str]] = None,
     verbose: bool = True,
     use_kernel: bool = False,
+    quant_4bit: str = "nf4",
 ) -> nn.Module:
     """Replace linear layers in-place using a per-layer precision allocation.
 
@@ -117,7 +120,7 @@ def quantize_model_mixed(
         original_size += orig_bytes
 
         new_layer = create_quantized_linear(
-            module, precision=precision, use_kernel=use_kernel
+            module, precision=precision, use_kernel=use_kernel, quant_4bit=quant_4bit
         )
         quantized_size += _quantized_bytes(new_layer, orig_bytes)
 
@@ -132,27 +135,14 @@ def quantize_model_mixed(
     if verbose:
         ratio = original_size / quantized_size if quantized_size > 0 else 1.0
         mode = "uniform" if not allocation else "mixed-precision"
+        label_4bit = quant_4bit.upper()
         print(f"Quantization complete ({mode}):")
-        print(f"  FP16: {stats['fp16']}  INT8: {stats['int8']}  INT4: {stats['int4']} layers")
+        print(f"  FP16: {stats['fp16']}  INT8: {stats['int8']}  "
+              f"{label_4bit}: {stats['int4']} layers")
         print(f"  {original_size / 1024**2:.1f} MB -> {quantized_size / 1024**2:.1f} MB "
               f"({ratio:.2f}x smaller)")
 
     return model
-
-
-# Backwards-compatible alias for the previous public name.
-def quantize_model_ladq(
-    model: nn.Module,
-    precision_allocation: Dict[str, str],
-    exclude_patterns: Optional[List[str]] = None,
-    verbose: bool = True,
-) -> nn.Module:
-    return quantize_model_mixed(
-        model,
-        allocation=precision_allocation,
-        exclude_patterns=exclude_patterns,
-        verbose=verbose,
-    )
 
 
 def get_model_info(model: nn.Module) -> dict:

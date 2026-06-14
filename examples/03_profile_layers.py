@@ -8,7 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from atlasinfer import SensitivityProfiler, print_sensitivity_report
 
-MODEL = "gpt2"
+MODEL = "Qwen/Qwen2.5-0.5B"
 
 
 def main():

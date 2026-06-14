@@ -15,7 +15,6 @@ Two allocators are provided:
 * ``allocate_greedy`` - a fast sensitivity-ranked heuristic kept as a baseline so
   the optimal allocator's win can be quantified.
 """
-import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional
@@ -54,13 +53,14 @@ class AllocationResult:
     budget_bytes: int
     counts: Dict[str, int]               # precision label -> layer count
     predicted_error: float               # sum of chosen layers' relative errors
+    total_params: int = 0                # total params across allocated layers
 
     @property
     def avg_bits(self) -> float:
-        """Average bits-per-weight across all allocated layers."""
-        if not self.allocations:
+        """Parameter-weighted average bits-per-weight (matches the byte budget)."""
+        if not self.total_params:
             return 0.0
-        return 8.0 * _mean_bytes_per_param(self.allocations)
+        return 8.0 * self.total_bytes / self.total_params
 
     def summary(self) -> str:
         parts = ", ".join(
@@ -71,11 +71,6 @@ class AllocationResult:
             f"Memory: {self.total_bytes / 1024**3:.2f}/{self.budget_bytes / 1024**3:.2f} GB | "
             f"predicted error sum: {self.predicted_error:.3f}"
         )
-
-
-def _mean_bytes_per_param(allocations: Dict[str, str]) -> float:
-    vals = [BYTES_PER_PARAM.get(p, 2.0) for p in allocations.values()]
-    return sum(vals) / len(vals) if vals else 0.0
 
 
 def get_layer_sizes(model: torch.nn.Module) -> Dict[str, int]:
@@ -208,12 +203,14 @@ def _finalize(
     predicted_error: Optional[float] = None,
 ) -> AllocationResult:
     total_bytes = 0
+    total_params = 0
     err_sum = 0.0
     for name, opts in zip(names, options):
         chosen = alloc[name]
         for (p, b, e) in opts:
             if p == chosen:
                 total_bytes += b
+                total_params += int(round(b / BYTES_PER_PARAM.get(p, 2.0)))
                 err_sum += e
                 break
     counts: Dict[str, int] = {}
@@ -225,6 +222,7 @@ def _finalize(
         budget_bytes=budget_bytes,
         counts=counts,
         predicted_error=predicted_error if predicted_error is not None else err_sum,
+        total_params=total_params,
     )
 
 
@@ -269,6 +267,7 @@ def allocate_greedy(
         budget_bytes=budget_bytes,
         counts=counts,
         predicted_error=0.0,
+        total_params=sum(layer_sizes[n] for n in alloc),
     )
 
 
@@ -310,14 +309,3 @@ def print_allocation_report(
         if len(ranked) > top_n:
             print(f"... and {len(ranked) - top_n} more layers")
     print("=" * 72 + "\n")
-
-
-# Backwards-compatible thin wrapper around the previous class-based API.
-class PrecisionAllocator:
-    """Compatibility shim exposing greedy and optimal allocation."""
-
-    def allocate(self, sensitivities, layer_sizes, memory_budget_bytes, **_kw):
-        return allocate_greedy(sensitivities, layer_sizes, memory_budget_bytes)
-
-    def allocate_optimal(self, profiles, memory_budget_bytes, **_kw):
-        return allocate_optimal(profiles, memory_budget_bytes)

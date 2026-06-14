@@ -122,9 +122,12 @@ class QuantizedLinear4bit(nn.Module):
         bias: Optional[torch.Tensor] = None,
         in_features: Optional[int] = None,
         out_features: Optional[int] = None,
+        scheme: str = "int4",
     ):
         super().__init__()
-        self.precision = "int4"
+        # scheme: "int4" (symmetric [-7,7]) or "nf4" (NormalFloat codebook).
+        self.scheme = scheme
+        self.precision = scheme
 
         self.register_buffer("q_packed", quantized_weights.packed_data)
         self.register_buffer("q_scales", quantized_weights.scales)
@@ -160,8 +163,12 @@ class QuantizedLinear4bit(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from .quantizer import dequantize_tensor_nf4
         in_dtype = x.dtype
-        weight = dequantize_tensor_fp4(self.quantized_weights, device=x.device)
+        if self.scheme == "nf4":
+            weight = dequantize_tensor_nf4(self.quantized_weights, device=x.device)
+        else:
+            weight = dequantize_tensor_fp4(self.quantized_weights, device=x.device)
         bias = self.bias.to(weight.dtype) if self.bias is not None else None
         out = F.linear(x.to(weight.dtype), weight, bias)
         return out.to(in_dtype)
@@ -178,11 +185,13 @@ class QuantizedLinear4bit(nn.Module):
         linear: nn.Linear,
         block_size: int = 64,
         outlier_threshold: float = 2.5,
+        scheme: str = "int4",
     ) -> "QuantizedLinear4bit":
-        from .quantizer import quantize_tensor_fp4
+        from .quantizer import quantize_tensor_fp4, quantize_tensor_nf4
 
         weight_cpu = linear.weight.data.cpu()
-        quantized_weights = quantize_tensor_fp4(
+        quantizer = quantize_tensor_nf4 if scheme == "nf4" else quantize_tensor_fp4
+        quantized_weights = quantizer(
             weight_cpu,
             block_size=block_size,
             outlier_threshold=outlier_threshold,
@@ -194,6 +203,7 @@ class QuantizedLinear4bit(nn.Module):
             bias=bias,
             in_features=linear.in_features,
             out_features=linear.out_features,
+            scheme=scheme,
         )
 
 
@@ -218,6 +228,7 @@ def create_quantized_linear(
     outlier_threshold_int8: float = 3.0,
     outlier_threshold_int4: float = 2.5,
     use_kernel: bool = False,
+    quant_4bit: str = "nf4",
 ) -> Union[QuantizedLinear, QuantizedLinear4bit, nn.Linear]:
     """Create the appropriate quantized layer for the requested precision.
 
@@ -228,6 +239,8 @@ def create_quantized_linear(
         use_kernel: if True, INT8/INT4 layers use the fused-kernel modules
             (``W8A16Linear`` / ``W4A16Linear``; per-channel, Triton-accelerated on
             CUDA) instead of the block-wise + outlier eager layers.
+        quant_4bit: 4-bit scheme for the eager path - ``"nf4"`` (NormalFloat,
+            default, better for Gaussian weights) or ``"int4"`` (symmetric).
 
     Returns:
         A quantized layer, or the (possibly converted) dense layer for fp16.
@@ -259,6 +272,7 @@ def create_quantized_linear(
             linear,
             block_size=block_size_int4,
             outlier_threshold=outlier_threshold_int4,
+            scheme=quant_4bit,
         )
     else:
         raise ValueError(

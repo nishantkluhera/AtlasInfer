@@ -44,7 +44,7 @@ class AtlasInference:
             model_name: HuggingFace model name or path
             quantize: Whether to apply quantization
             cpu_offload: Whether to use CPU offloading (for models larger than VRAM)
-            memory_budget_gb: Memory budget for LADQ (enables mixed precision if set)
+            memory_budget_gb: Memory budget that enables mixed precision if set
             block_size: Block size for quantization
             outlier_threshold: Z-score threshold for outlier detection
             device: Target device ('cuda', 'cpu', or None for auto)
@@ -311,7 +311,7 @@ Examples:
         '--memory-budget',
         type=float,
         default=None,
-        help='Memory budget in GB for LADQ (enables mixed-precision)'
+        help='Memory budget in GB (enables mixed-precision allocation)'
     )
     parser.add_argument(
         '--cpu-offload',

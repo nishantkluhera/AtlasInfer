@@ -176,9 +176,19 @@ cython_debug/
 .ruff_cache/
 
 # AtlasInfer
-.atlasinfer_cache/
-results_smoke/
-results_run.log
+results_smoke/   # scratch benchmark output (results/ IS committed)
+*.log
+
+# Secrets — never commit HF tokens / credentials (they live in ~/.cache/huggingface,
+# outside this repo, but ignore these patterns defensively just in case)
+.env
+.env.*
+*.token
+*token*.txt
+hf_token*
+.huggingface/
+secrets*
+credentials*
 
 # PyPI configuration file
 .pypirc

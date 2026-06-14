@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from atlasinfer.sensitivity import SensitivityProfiler
 from atlasinfer.allocator import allocate_optimal
 from atlasinfer.patcher import quantize_model_mixed, quantize_model, get_model_info
-from atlasinfer.linear import QuantizedLinear, QuantizedLinear4bit
+from atlasinfer.linear import QuantizedLinear
 from atlasinfer.offload import _move, CPUOffloadHook, estimate_model_memory
 
 
@@ -111,6 +111,21 @@ class TestUniformAndInfo:
         mem = estimate_model_memory(model)
         assert mem["quantized_bytes"] > 0
         assert isinstance(model.fc1, QuantizedLinear)
+
+
+class TestQuant4bitScheme:
+    def test_nf4_is_default_4bit_scheme(self):
+        model = TinyLM().eval()
+        quantize_model(model, precision="int4", verbose=False)  # default quant_4bit
+        # fc1/fc2 are QuantizedLinear4bit with the NF4 scheme.
+        assert model.fc1.scheme == "nf4" and model.fc2.scheme == "nf4"
+        assert not torch.isnan(model(torch.randint(0, 64, (1, 16))).logits).any()
+
+    def test_symmetric_int4_still_available(self):
+        model = TinyLM().eval()
+        quantize_model(model, precision="int4", quant_4bit="int4", verbose=False)
+        assert model.fc1.scheme == "int4"
+        assert not torch.isnan(model(torch.randint(0, 64, (1, 16))).logits).any()
 
 
 class TestKernelBackend:

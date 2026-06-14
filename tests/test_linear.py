@@ -9,7 +9,6 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from atlasinfer.quantizer import quantize_tensor
 from atlasinfer.linear import QuantizedLinear
 from atlasinfer.patcher import quantize_model, get_model_info
 

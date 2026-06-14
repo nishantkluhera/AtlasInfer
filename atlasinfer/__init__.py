@@ -17,21 +17,19 @@ __version__ = "2.1.0"
 from .quantizer import (
     quantize_tensor, dequantize_tensor, QuantizedTensor,
     quantize_tensor_fp4, dequantize_tensor_fp4, QuantizedTensor4bit,
+    quantize_tensor_nf4, dequantize_tensor_nf4, NF4_LEVELS,
     compression_ratio,
 )
 from .linear import QuantizedLinear, QuantizedLinear4bit, create_quantized_linear
-from .patcher import (
-    quantize_model, quantize_model_mixed, quantize_model_ladq, get_model_info,
-)
+from .patcher import quantize_model, quantize_model_mixed, get_model_info
 from .offload import setup_cpu_offload, CPUOffloadHook, estimate_model_memory
 from .sensitivity import (
-    SensitivityProfiler, LayerSensitivityProfiler, LayerProfile,
-    compute_sensitivity_scores, get_cache_path, print_sensitivity_report,
+    SensitivityProfiler, LayerProfile, print_sensitivity_report,
 )
 from .allocator import (
     PrecisionLevel, AllocationResult, get_layer_sizes,
     allocate_optimal, allocate_greedy, uniform_allocation,
-    estimate_memory_usage, print_allocation_report, PrecisionAllocator,
+    estimate_memory_usage, print_allocation_report,
 )
 from .triton_kernels import (
     HAS_TRITON, kernel_available, W8A16Linear, W4A16Linear,
@@ -43,21 +41,20 @@ __all__ = [
     # Quantization primitives
     "quantize_tensor", "dequantize_tensor", "QuantizedTensor",
     "quantize_tensor_fp4", "dequantize_tensor_fp4", "QuantizedTensor4bit",
+    "quantize_tensor_nf4", "dequantize_tensor_nf4", "NF4_LEVELS",
     "compression_ratio",
     # Layers
     "QuantizedLinear", "QuantizedLinear4bit", "create_quantized_linear",
     # Patching
-    "quantize_model", "quantize_model_mixed", "quantize_model_ladq",
-    "get_model_info",
+    "quantize_model", "quantize_model_mixed", "get_model_info",
     # Offloading
     "setup_cpu_offload", "CPUOffloadHook", "estimate_model_memory",
     # Sensitivity profiling
-    "SensitivityProfiler", "LayerSensitivityProfiler", "LayerProfile",
-    "compute_sensitivity_scores", "get_cache_path", "print_sensitivity_report",
+    "SensitivityProfiler", "LayerProfile", "print_sensitivity_report",
     # Allocation
     "PrecisionLevel", "AllocationResult", "get_layer_sizes",
     "allocate_optimal", "allocate_greedy", "uniform_allocation",
-    "estimate_memory_usage", "print_allocation_report", "PrecisionAllocator",
+    "estimate_memory_usage", "print_allocation_report",
     # Fused kernel
     "HAS_TRITON", "kernel_available", "W8A16Linear", "W4A16Linear",
     "quantize_w8a16", "quantize_w4a16",

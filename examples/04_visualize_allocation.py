@@ -7,7 +7,7 @@ precision it was assigned. The picture makes the method's logic concrete: the
 most loss-sensitive layers are kept at higher precision, the robust ones dropped
 to INT4.
 
-    python examples/04_visualize_allocation.py --model EleutherAI/pythia-410m --bits 5
+    python examples/04_visualize_allocation.py --model Qwen/Qwen3-0.6B-Base --bits 5
 
 Requires the benchmark extra (matplotlib): pip install -e ".[benchmark]"
 """
@@ -36,7 +36,7 @@ def _depth_key(name: str) -> int:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", "-m", default="EleutherAI/pythia-410m")
+    ap.add_argument("--model", "-m", default="Qwen/Qwen3-0.6B-Base")
     ap.add_argument("--bits", type=float, default=5.0, help="target avg bits/weight")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
@@ -65,7 +65,7 @@ def main():
     ax.scatter(xs, ys, c=colors, s=42, edgecolors="black", linewidths=0.4, zorder=3)
     ax.set_yscale("log")
     ax.set_xlabel("Linear layer (ordered by depth)")
-    ax.set_ylabel("End-to-end sensitivity (loss increase if INT4)")
+    ax.set_ylabel("End-to-end sensitivity (loss increase if dropped to 4-bit)")
     ax.set_title(
         f"Per-layer precision allocation — {args.model} "
         f"(avg {alloc.avg_bits:.1f} bits)"

@@ -86,7 +86,7 @@ def main():
     print(f"\nLatency / memory benchmark - {args.model} (decode {args.gen_tokens} tokens)\n")
     run("fp16", fresh_model(args.model))
     run("uniform-int8", quantize_model(fresh_model(args.model), precision="int8", verbose=False))
-    run("uniform-int4", quantize_model(fresh_model(args.model), precision="int4", verbose=False))
+    run("uniform-nf4", quantize_model(fresh_model(args.model), precision="int4", verbose=False))
 
     # Mixed precision at the requested average bit-width.
     base = fresh_model(args.model).to(device).eval()
