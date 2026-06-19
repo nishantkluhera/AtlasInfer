@@ -111,19 +111,24 @@ def load_wikitext():
     eval_text = "\n\n".join(t for t in test["text"] if t.strip())
 
     train = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-    calib = [t for t in train["text"] if len(t.strip()) > 200][:8]
+    # Plenty of calibration docs: the sensitivity profiler caps at its own
+    # max_samples (8), while GPTQ consumes many more for a well-conditioned Hessian.
+    calib = [t for t in train["text"] if len(t.strip()) > 200][:256]
     return calib, eval_text
 
 
 # --------------------------------------------------------------------------- #
 # Benchmark
 # --------------------------------------------------------------------------- #
-def fresh_model(model_name: str, dtype=torch.float16):
-    return AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype, low_cpu_mem_usage=True)
+def fresh_model(model_name: str, dtype=torch.float16, device_map=None):
+    return AutoModelForCausalLM.from_pretrained(
+        model_name, dtype=dtype, low_cpu_mem_usage=True, device_map=device_map)
 
 
-def run(model_name: str, eval_tokens: int, bit_targets: List[float], device: torch.device):
+def run(model_name: str, eval_tokens: int, bit_targets: List[float], device: torch.device,
+        device_map: bool = False):
     print(f"\n{'='*72}\nBenchmarking {model_name} on {device}\n{'='*72}")
+    dmap = "auto" if device_map else None
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     calib_texts, eval_text = load_wikitext()
 
@@ -134,7 +139,7 @@ def run(model_name: str, eval_tokens: int, bit_targets: List[float], device: tor
     results = []
 
     def measure(label: str, model, avg_bits: Optional[float]):
-        model = model.to(device).eval()
+        model = model.eval() if device_map else model.to(device).eval()
         t0 = time.time()
         ppl = evaluate_perplexity(
             model, tokenizer, eval_text, device,
@@ -146,29 +151,32 @@ def run(model_name: str, eval_tokens: int, bit_targets: List[float], device: tor
         print(f"  {label:<18} ppl={ppl:8.3f}  weights={mb:8.1f} MB  "
               f"avg_bits={bits:4.1f}  ({dt:.1f}s)")
         results.append({"config": label, "ppl": ppl, "mb": mb, "avg_bits": bits})
-        model.to("cpu")
+        if not device_map:
+            model.to("cpu")
         del model
         gc.collect()
         torch.cuda.empty_cache()
 
+    def load():
+        return fresh_model(model_name, device_map=dmap)
+
     # 1) FP16 baseline
-    measure("fp16", fresh_model(model_name), 16.0)
+    measure("fp16", load(), 16.0)
 
     # 2) Uniform INT8 / INT4
-    m = quantize_model(fresh_model(model_name), precision="int8", verbose=False)
-    measure("uniform-int8", m, 8.0)
+    measure("uniform-int8", quantize_model(load(), precision="int8", verbose=False), 8.0)
     # 4-bit defaults to NF4 (the better codebook); see compare_baselines.py.
-    m = quantize_model(fresh_model(model_name), precision="int4", verbose=False)
-    measure("uniform-nf4", m, 4.0)
+    measure("uniform-nf4", quantize_model(load(), precision="int4", verbose=False), 4.0)
 
     # 3) Mixed precision sweep. Profile ONCE, reuse across budgets.
     print("  profiling layer sensitivities end-to-end (once)...")
-    base = fresh_model(model_name).to(device).eval()
+    base = load().eval() if device_map else load().to(device).eval()
     profiler = SensitivityProfiler()
     profiles = profiler.profile_end_to_end(
         base, tokenizer=tokenizer, calibration_texts=calib_texts
     )
-    base.to("cpu")
+    if not device_map:
+        base.to("cpu")
     del base
     gc.collect()
     torch.cuda.empty_cache()
@@ -178,9 +186,7 @@ def run(model_name: str, eval_tokens: int, bit_targets: List[float], device: tor
         budget_bytes = int(n_params * target_bits / 8)
         alloc = allocate_optimal(profiles, budget_bytes=budget_bytes)
         actual_bits = alloc.avg_bits
-        m = quantize_model_mixed(
-            fresh_model(model_name), allocation=alloc.allocations, verbose=False
-        )
+        m = quantize_model_mixed(load(), allocation=alloc.allocations, verbose=False)
         measure(f"mixed-{target_bits:g}bit", m, actual_bits)
 
     return results
@@ -258,10 +264,12 @@ def main():
     ap.add_argument("--bits", type=float, nargs="+", default=[4.5, 5.0, 6.0],
                     help="Target average bit-widths for the mixed sweep")
     ap.add_argument("--out", default="results", help="Output directory")
+    ap.add_argument("--device-map", action="store_true",
+                    help="shard across all GPUs (device_map=auto) for big models, e.g. on Kaggle T4x2")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    results = run(args.model, args.eval_tokens, args.bits, device)
+    results = run(args.model, args.eval_tokens, args.bits, device, device_map=args.device_map)
     write_outputs(args.model, results, args.out)
 
 

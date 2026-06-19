@@ -35,6 +35,7 @@ from .triton_kernels import (
     HAS_TRITON, kernel_available, W8A16Linear, W4A16Linear,
     quantize_w8a16, quantize_w4a16,
 )
+from .gptq import gptq_quantize_nf4, quantize_model_gptq
 from .inference import AtlasInference
 
 __all__ = [
@@ -58,6 +59,8 @@ __all__ = [
     # Fused kernel
     "HAS_TRITON", "kernel_available", "W8A16Linear", "W4A16Linear",
     "quantize_w8a16", "quantize_w4a16",
+    # GPTQ
+    "gptq_quantize_nf4", "quantize_model_gptq",
     # Inference
     "AtlasInference",
 ]

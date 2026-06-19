@@ -118,10 +118,11 @@ def quantize_model_mixed(
 
         orig_bytes = _dense_bytes(module)
         original_size += orig_bytes
+        mdev = next(module.parameters()).device  # keep each layer on its own device
 
         new_layer = create_quantized_linear(
             module, precision=precision, use_kernel=use_kernel, quant_4bit=quant_4bit
-        )
+        ).to(mdev)
         quantized_size += _quantized_bytes(new_layer, orig_bytes)
 
         setattr(parent, attr, new_layer)
