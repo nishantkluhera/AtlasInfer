@@ -13,6 +13,12 @@ Triton is Linux+GPU only (incl. WSL2). This module imports cleanly without it;
 ``HAS_TRITON`` is False and the helpers raise if called. Quantization here is
 symmetric per-output-channel int8 (no per-block / outlier handling) — a clean,
 self-contained kernel demo rather than a drop-in for the full AtlasInfer format.
+
+The GEMM tiling (block sizes, warps, pipeline stages) is chosen by
+``@triton.autotune`` per ``(M, N, K)`` so the kernel ports across GPU
+architectures: a single fixed tile that's near-optimal on Ampere (cp.async
+software pipelining) stalls badly on Turing (no cp.async), so we let Triton pick
+the schedule for whatever card it runs on.
 """
 from typing import Optional
 
@@ -83,6 +89,33 @@ def _unpack_w4(packed: torch.Tensor) -> torch.Tensor:
 
 if HAS_TRITON:
 
+    # Autotune space. The original fixed tile (BLOCK_N=64, BLOCK_K=64, 4 warps,
+    # ~2 stages) is near-optimal on Ampere but ~7x slower than FP16 on a Turing
+    # T4, which lacks cp.async pipelining and needs more concurrent blocks (smaller
+    # BLOCK_N) and shallower pipelines (fewer stages) to hide HBM latency. Triton
+    # picks per (M, N, K); configs that overflow a card's shared memory are pruned.
+    _W8_CONFIGS = [
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32,  "BLOCK_K": 64},  num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64},  num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K": 32},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
+    ]
+    _W4_CONFIGS = [
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32,  "BLOCK_K2": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K2": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K2": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K2": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K2": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K2": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K2": 32}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64,  "BLOCK_K2": 32}, num_warps=4, num_stages=2),
+    ]
+
+    @triton.autotune(configs=_W8_CONFIGS, key=["M", "N", "K"])
     @triton.jit
     def _w8a16_gemm_kernel(
         x_ptr, qw_ptr, scale_ptr, bias_ptr, y_ptr,
@@ -127,11 +160,11 @@ if HAS_TRITON:
         qweight: torch.Tensor,
         scale: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
-        block_m: int = 16,
-        block_n: int = 64,
-        block_k: int = 64,
     ) -> torch.Tensor:
         """y = (x @ dequant(qweight).T) using the fused int8 kernel.
+
+        Tiling is chosen by ``@triton.autotune`` per (M, N, K); the first call for
+        a new shape pays a one-time tuning sweep, then it's cached.
 
         Args:
             x: (..., K) FP16 activations.
@@ -145,7 +178,7 @@ if HAS_TRITON:
         M = xf.shape[0]
         y = torch.empty((M, N), device=x.device, dtype=torch.float16)
 
-        grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
         _w8a16_gemm_kernel[grid](
             xf, qweight, scale,
             bias if bias is not None else scale,  # placeholder ptr when no bias
@@ -155,10 +188,10 @@ if HAS_TRITON:
             qweight.stride(0), qweight.stride(1),
             y.stride(0), y.stride(1),
             HAS_BIAS=bias is not None,
-            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
         )
         return y.reshape(*batch, N)
 
+    @triton.autotune(configs=_W4_CONFIGS, key=["M", "N", "K2"])
     @triton.jit
     def _w4a16_gemm_kernel(
         x_ptr, pw_ptr, scale_ptr, bias_ptr, y_ptr,
@@ -208,17 +241,19 @@ if HAS_TRITON:
         tl.store(y_ptrs, acc.to(tl.float16),
                  mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
-    def w4a16_linear(x, packed, scale, bias=None, block_m=16, block_n=64, block_k2=64):
+    def w4a16_linear(x, packed, scale, bias=None):
         """y = (x @ dequant(packed).T) using the fused int4 kernel.
 
-        packed: (N, K//2) int8 nibble-packed weights; scale: (N,) fp16.
+        packed: (N, K//2) int8 nibble-packed weights; scale: (N,) fp16. Tiling is
+        autotuned per (M, N, K2); the first call for a new shape pays a one-time
+        tuning sweep, then it's cached.
         """
         *batch, K = x.shape
         N, K2 = packed.shape
         xf = x.reshape(-1, K).to(torch.float16).contiguous()
         M = xf.shape[0]
         y = torch.empty((M, N), device=x.device, dtype=torch.float16)
-        grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+        grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
         _w4a16_gemm_kernel[grid](
             xf, packed, scale,
             bias if bias is not None else scale,
@@ -228,7 +263,6 @@ if HAS_TRITON:
             packed.stride(0), packed.stride(1),
             y.stride(0), y.stride(1),
             HAS_BIAS=bias is not None,
-            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K2=block_k2,
         )
         return y.reshape(*batch, N)
 
