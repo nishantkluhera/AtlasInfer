@@ -27,12 +27,13 @@ class TestQuantizeW8A16:
         W = torch.randn(128, 256, dtype=torch.float16) * 0.05
         q, scale = quantize_w8a16(W)
 
-        assert q.shape == W.shape and q.dtype == torch.int8
+        # Stored transposed (K, N) so the kernel's weight load is coalesced.
+        assert q.shape == (W.shape[1], W.shape[0]) and q.dtype == torch.int8
         assert scale.shape == (128,) and scale.dtype == torch.float16
         assert q.abs().max() <= 127
 
-        # Per-channel int8 should reconstruct the weight closely.
-        dq = q.to(torch.float32) * scale.to(torch.float32)[:, None]
+        # Per-channel int8 should reconstruct the weight closely (transpose back to (N, K)).
+        dq = q.t().to(torch.float32) * scale.to(torch.float32)[:, None]
         rel = (W.float() - dq).norm() / W.float().norm()
         assert rel < 0.02, f"reconstruction error too high: {rel}"
 
@@ -47,7 +48,7 @@ class TestW8A16LinearEager:
         layer = W8A16Linear.from_linear(lin)
 
         assert layer.qweight.dtype == torch.int8
-        assert layer.qweight.shape == (128, 256)
+        assert layer.qweight.shape == (256, 128)  # (K, N), transposed for the kernel
 
         x = torch.randn(4, 256)
         ref = lin(x)

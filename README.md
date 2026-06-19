@@ -238,14 +238,37 @@ All the runtime/kernel tables above are on an Ampere RTX 3060. Kaggle's free
 **Tesla T4** (Turing) is the most accessible GPU for reproducing this, so these T4
 measurements are reported **separately** rather than mixed into the 3060 numbers.
 
+**Accuracy holds up at 3B (and still beats bitsandbytes).** WikiText-2 perplexity
+on Qwen2.5-3B (`python benchmark.py` + `python compare_baselines.py`, run on the
+T4):
+
+| Method | ~bits | Weights (MB) | Perplexity | Δ vs FP16 |
+| --- | ---: | ---: | ---: | ---: |
+| fp16 | 16 | 5886.0 | 7.527 | +0.000 |
+| AtlasInfer int8 | 8 | 3396.3 | 7.529 | **+0.002** |
+| bnb int8 (LLM.int8) | 8 | 3240.0 | 7.607 | +0.080 |
+| AtlasInfer mixed-7bit | 7.0 | 3141.0 | 7.637 | +0.110 |
+| AtlasInfer mixed-6bit | 6.0 | 2867.8 | 7.669 | +0.142 |
+| AtlasInfer mixed-5bit | 5.0 | 2572.8 | 7.725 | **+0.198** |
+| AtlasInfer mixed-4.5bit | 4.4 | 2420.7 | 7.757 | +0.230 |
+| AtlasInfer nf4 | 4 | 2304.1 | 7.859 | **+0.332** |
+| bnb nf4 | 4 | 1917.0 | 7.965 | +0.438 |
+| AtlasInfer int4 (symmetric) | 4 | 2304.1 | 8.086 | +0.559 |
+
+Same pattern as the smaller models, at 6× the size: INT8 is essentially lossless
+and ahead of bnb (+0.002 vs +0.080); NF4 beats bnb's NF4 (+0.332 vs +0.438); and
+the mixed-precision sweep traces the curve between. (GPTQ-NF4, the best 4-bit
+method on the smaller models, wasn't run here — it would slot in below NF4. bnb
+stays ~17% smaller at 4-bit via scale double-quantization.)
+
 **Eager decode reaches 3B — and the latency cost grows with model size.**
 Qwen2.5-3B, 64-token decode, eager block-wise path
 (`python bench_latency.py --model Qwen/Qwen2.5-3B`):
 
 | Config | Peak GPU (MB) | vs FP16 | tok/s | rel. speed |
 | --- | ---: | ---: | ---: | ---: |
-| fp16 | 6008.3 | 1.00x | 19.8 | 1.00x |
-| uniform-int8 | 3684.6 | 0.61x | 3.6 | 0.18x |
+| fp16 | 6008.3 | 1.00x | 19.1 | 1.00x |
+| uniform-int8 | 3684.6 | 0.61x | 3.6 | 0.19x |
 | uniform-nf4 | 2761.3 | 0.46x | 1.0 | 0.05x |
 | mixed-5bit | 3045.1 | 0.51x | 1.2 | 0.06x |
 
@@ -257,13 +280,15 @@ fused kernel exists to remove.
 **Kernel portability (Turing vs Ampere).** The fused kernel's batch-1 speedup was
 tuned on Ampere. A single fixed tile that streams at ~215 GB/s on the 3060 stalled
 at ~17 GB/s on the T4 — roughly **7× *slower* than FP16** — because Turing lacks
-the `cp.async` software pipelining Ampere relies on, so that schedule can't hide
-HBM latency. The fix isn't T4-specific code: the kernel now **autotunes its tile
-size, warp count, and pipeline depth per `(M, N, K)`**
-([`triton_kernels.py`](atlasinfer/triton_kernels.py)), so Triton picks an Ampere
-schedule on the 3060 and a higher-occupancy, shallower-pipeline schedule on the
-T4. *(Post-autotune T4 kernel throughput: re-measure with
-`bench_triton_kernel.py` — pending.)*
+the `cp.async` software pipelining Ampere relies on. Two fixes
+([`triton_kernels.py`](atlasinfer/triton_kernels.py)): (1) the kernel **autotunes
+tile size / warps / pipeline depth per `(M, N, K)`**, and — the one that actually
+mattered — (2) the int8/int4 weights are stored **transposed `(K, N)`** so the
+kernel's fast tile axis is contiguous and the weight loads **coalesce** (with the
+natural `(N, K)` layout each load was strided by K, which Ampere hides via
+`cp.async` but Turing can't). Autotuning alone left the T4 ~7× slow — confirming
+the bottleneck was the access pattern, not the schedule. *(Post-fix T4 kernel
+throughput: re-measure with `bench_triton_kernel.py` — pending.)*
 
 ### vs bitsandbytes (the accessible-quant baseline)
 

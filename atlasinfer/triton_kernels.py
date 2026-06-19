@@ -40,29 +40,37 @@ def kernel_available() -> bool:
 
 
 def quantize_w8a16(weight: torch.Tensor):
-    """Symmetric per-output-channel int8 quantization.
+    """Symmetric per-output-channel int8 quantization, stored **transposed** for the kernel.
 
     Args:
-        weight: dense weight of shape (out_features, in_features).
+        weight: dense weight of shape (out_features N, in_features K).
     Returns:
-        (qweight int8 [N, K], scale fp16 [N]).
+        (qweight int8 [K, N], scale fp16 [N]). The int8 weight is returned
+        transposed to (K, N) so the fused GEMM's weight tile load is **coalesced**
+        — consecutive output channels (the kernel's fast tile axis) are contiguous
+        in memory. With the natural (N, K) layout that load is strided by K, which
+        Ampere hides via cp.async but Turing (T4) can't, costing ~7x. The eager
+        fallback transposes back.
     """
     scale = weight.abs().amax(dim=1).clamp(min=1e-8) / 127.0
     q = (weight / scale[:, None]).round().clamp(-127, 127).to(torch.int8)
-    return q.contiguous(), scale.to(torch.float16)
+    return q.t().contiguous(), scale.to(torch.float16)   # (K, N), coalesced for the kernel
 
 
 def quantize_w4a16(weight: torch.Tensor):
     """Symmetric per-output-channel int4 quantization, packed 2-per-byte along K.
 
-    Each output byte holds two consecutive K values: low nibble = even K, high
-    nibble = odd K, each stored as ``value + 8`` so the nibble is unsigned [1,15].
+    Each packed byte holds two consecutive K values for one output channel: low
+    nibble = even K, high nibble = odd K, each stored as ``value + 8`` so the
+    nibble is unsigned [1,15]. The packed tensor is returned **transposed** to
+    (K//2, N) so the fused GEMM's weight tile load is coalesced (see
+    :func:`quantize_w8a16`); the eager fallback transposes back.
 
     Args:
         weight: dense weight (out_features N, in_features K). K must be even
             (always true for transformer layers).
     Returns:
-        (packed int8 [N, K//2], scale fp16 [N]).
+        (packed uint8 [K//2, N], scale fp16 [N]).
     """
     N, K = weight.shape
     if K % 2 != 0:
@@ -72,16 +80,17 @@ def quantize_w4a16(weight: torch.Tensor):
     low_u = (q[:, 0::2] + 8).to(torch.uint8) & 0xF   # even K -> low nibble
     high_u = (q[:, 1::2] + 8).to(torch.uint8) & 0xF  # odd  K -> high nibble
     packed = ((high_u << 4) | low_u)                 # (N, K//2) uint8
-    return packed.contiguous(), scale.to(torch.float16)
+    return packed.t().contiguous(), scale.to(torch.float16)   # (K//2, N), coalesced
 
 
 def _unpack_w4(packed: torch.Tensor) -> torch.Tensor:
-    """Unpack (N, K//2) uint8 nibble-packed weights back to (N, K) int8 in [-7,7]."""
-    pu = packed.to(torch.int16) & 0xFF
+    """Unpack kernel-layout (K//2, N) nibble-packed weights to (N, K) int8 in [-7,7]."""
+    p = packed.t().contiguous()                       # (K//2, N) -> (N, K//2)
+    pu = p.to(torch.int16) & 0xFF
     low = (pu & 0xF) - 8
     high = ((pu >> 4) & 0xF) - 8
-    N, K2 = packed.shape
-    q = torch.empty((N, K2 * 2), dtype=torch.int16, device=packed.device)
+    N, K2 = p.shape
+    q = torch.empty((N, K2 * 2), dtype=torch.int16, device=p.device)
     q[:, 0::2] = low
     q[:, 1::2] = high
     return q.to(torch.int8)
@@ -89,11 +98,12 @@ def _unpack_w4(packed: torch.Tensor) -> torch.Tensor:
 
 if HAS_TRITON:
 
-    # Autotune space. The original fixed tile (BLOCK_N=64, BLOCK_K=64, 4 warps,
-    # ~2 stages) is near-optimal on Ampere but ~7x slower than FP16 on a Turing
-    # T4, which lacks cp.async pipelining and needs more concurrent blocks (smaller
-    # BLOCK_N) and shallower pipelines (fewer stages) to hide HBM latency. Triton
-    # picks per (M, N, K); configs that overflow a card's shared memory are pruned.
+    # Autotune the tile schedule per (M, N, K). Tiling alone did NOT recover the
+    # Turing T4 (every config stayed ~7x slower than FP16) — the real penalty there
+    # was the strided/uncoalesced weight load, now fixed by storing the weights
+    # transposed (K, N) in quantize_w8a16/quantize_w4a16. Autotuning still earns its
+    # keep: it lets Triton pick an Ampere-friendly tile on the 3060 and a
+    # higher-occupancy one elsewhere. Configs that overflow shared memory are pruned.
     _W8_CONFIGS = [
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 32,  "BLOCK_K": 64},  num_warps=2, num_stages=2),
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 64,  "BLOCK_K": 64},  num_warps=4, num_stages=2),
@@ -133,7 +143,9 @@ if HAS_TRITON:
         offs_k = tl.arange(0, BLOCK_K)
 
         x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
-        # Weight tile shaped (BLOCK_K, BLOCK_N): element [k, n] == qweight[n, k].
+        # Weight tile (BLOCK_K, BLOCK_N): element [k, n] == qweight_T[k, n] (the
+        # int8 weight is stored transposed (K, N), so the fast axis n is contiguous
+        # -> stride_qn == 1 -> coalesced loads).
         qw_ptrs = qw_ptr + offs_k[:, None] * stride_qk + offs_n[None, :] * stride_qn
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -168,12 +180,12 @@ if HAS_TRITON:
 
         Args:
             x: (..., K) FP16 activations.
-            qweight: (N, K) int8 weights.
+            qweight: (K, N) int8 weights, transposed for coalesced loads.
             scale: (N,) FP16 per-output-channel scales.
             bias: optional (N,) bias.
         """
         *batch, K = x.shape
-        N = qweight.shape[0]
+        N = qweight.shape[1]                  # qweight is (K, N)
         xf = x.reshape(-1, K).to(torch.float16).contiguous()
         M = xf.shape[0]
         y = torch.empty((M, N), device=x.device, dtype=torch.float16)
@@ -185,7 +197,7 @@ if HAS_TRITON:
             y,
             M, N, K,
             xf.stride(0), xf.stride(1),
-            qweight.stride(0), qweight.stride(1),
+            qweight.stride(1), qweight.stride(0),  # (stride_qn, stride_qk) for (K, N)
             y.stride(0), y.stride(1),
             HAS_BIAS=bias is not None,
         )
@@ -202,9 +214,10 @@ if HAS_TRITON:
         HAS_BIAS: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K2: tl.constexpr,
     ):
-        # K2 = K // 2 packed columns. Each packed byte holds two int4 weights:
-        # low nibble = even-K weight, high nibble = odd-K weight. We avoid nibble
-        # interleaving by contracting the even and odd halves separately.
+        # K2 = K // 2 packed rows (the weight is stored transposed (K2, N) so the
+        # fast axis n is contiguous -> stride_pn == 1 -> coalesced loads). Each
+        # packed byte holds two int4 weights: low nibble = even-K, high nibble =
+        # odd-K; we avoid nibble interleaving by contracting the halves separately.
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -244,12 +257,12 @@ if HAS_TRITON:
     def w4a16_linear(x, packed, scale, bias=None):
         """y = (x @ dequant(packed).T) using the fused int4 kernel.
 
-        packed: (N, K//2) int8 nibble-packed weights; scale: (N,) fp16. Tiling is
-        autotuned per (M, N, K2); the first call for a new shape pays a one-time
-        tuning sweep, then it's cached.
+        packed: (K//2, N) uint8 nibble-packed weights (transposed for coalesced
+        loads); scale: (N,) fp16. Tiling is autotuned per (M, N, K2); the first
+        call for a new shape pays a one-time tuning sweep, then it's cached.
         """
         *batch, K = x.shape
-        N, K2 = packed.shape
+        K2, N = packed.shape                 # packed is (K//2, N)
         xf = x.reshape(-1, K).to(torch.float16).contiguous()
         M = xf.shape[0]
         y = torch.empty((M, N), device=x.device, dtype=torch.float16)
@@ -260,7 +273,7 @@ if HAS_TRITON:
             y,
             M, N, K2,
             xf.stride(0), xf.stride(1),
-            packed.stride(0), packed.stride(1),
+            packed.stride(1), packed.stride(0),  # (stride_pn, stride_pk) for (K2, N)
             y.stride(0), y.stride(1),
             HAS_BIAS=bias is not None,
         )
@@ -293,13 +306,13 @@ class W8A16Linear(nn.Module):
     def __init__(self, qweight, scale, bias=None, in_features=None, out_features=None):
         super().__init__()
         self.precision = "int8-kernel"
-        self.register_buffer("qweight", qweight)  # (N, K) int8
+        self.register_buffer("qweight", qweight)  # (K, N) int8 (transposed)
         self.register_buffer("scale", scale)      # (N,) fp16
         if bias is not None:
             self.register_buffer("bias", bias)
         else:
             self.bias = None
-        n, k = qweight.shape
+        k, n = qweight.shape
         self.out_features = out_features if out_features is not None else n
         self.in_features = in_features if in_features is not None else k
 
@@ -307,8 +320,9 @@ class W8A16Linear(nn.Module):
         if HAS_TRITON and x.is_cuda:
             return w8a16_linear(x, self.qweight, self.scale, self.bias)
         # Eager fallback (CPU / no Triton): correct, just not accelerated.
+        # qweight is stored transposed (K, N); F.linear wants (N, K).
         in_dtype = x.dtype
-        w = self.qweight.to(torch.float16) * self.scale.to(torch.float16)[:, None]
+        w = self.qweight.t().to(torch.float16) * self.scale.to(torch.float16)[:, None]
         bias = self.bias.to(torch.float16) if self.bias is not None else None
         return F.linear(x.to(torch.float16), w, bias).to(in_dtype)
 
@@ -341,13 +355,13 @@ class W4A16Linear(nn.Module):
     def __init__(self, packed, scale, bias=None, in_features=None, out_features=None):
         super().__init__()
         self.precision = "int4-kernel"
-        self.register_buffer("packed", packed)  # (N, K//2) int8
+        self.register_buffer("packed", packed)  # (K//2, N) uint8 (transposed)
         self.register_buffer("scale", scale)    # (N,) fp16
         if bias is not None:
             self.register_buffer("bias", bias)
         else:
             self.bias = None
-        n, k2 = packed.shape
+        k2, n = packed.shape
         self.out_features = out_features if out_features is not None else n
         self.in_features = in_features if in_features is not None else k2 * 2
 
