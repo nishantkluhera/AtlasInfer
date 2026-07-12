@@ -19,7 +19,7 @@ import gc
 import torch
 import torch.nn as nn
 
-from .quantizer import NF4_LEVELS, QuantizedTensor4bit, quantize_tensor_nf4
+from .quantizer import NF4_LEVELS, QuantizedTensor4bit, quantize_tensor_nf4, _find_outliers
 from .linear import QuantizedLinear4bit, _conv1d_to_linear
 from .patcher import _collect_targets, DEFAULT_EXCLUDE
 from .sensitivity import SensitivityProfiler
@@ -62,11 +62,11 @@ def gptq_quantize_nf4(W: torch.Tensor, H: torch.Tensor, group_size: int = 64,
         raise ValueError(f"in_features {cols} not divisible by group_size {group_size}")
     num_groups = cols // group_size
 
-    # Outlier mask on the original weights, per (row, group) by z-score.
-    Wg = W.view(out, num_groups, group_size)
-    mean = Wg.mean(dim=-1, keepdim=True)
-    std = Wg.std(dim=-1, keepdim=True).clamp(min=1e-6)
-    omask = ((Wg - mean).abs() / std > outlier_threshold).view(out, cols)
+    # Outlier mask on the original weights, per (row, group). Uses the same
+    # robust median/MAD detector as the block quantizer so a cluster of large
+    # weights in a group can't inflate its spread and mask one another (see
+    # quantizer._find_outliers).
+    omask = _find_outliers(W.reshape(-1, group_size), outlier_threshold).reshape(out, cols)
 
     H = H.clone().float().to(dev)
     diag = torch.arange(cols, device=dev)

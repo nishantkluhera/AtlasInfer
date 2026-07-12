@@ -164,9 +164,15 @@ class AtlasInference:
         attention_mask = inputs.attention_mask.to(input_device)
 
         # KV-cache tensors created on the GPU don't survive a block being evicted
-        # back to CPU, so disable the cache when offloading.
+        # back to CPU, so the cache is unsupported when offloading. Hard-disable
+        # it (not setdefault): an explicit use_cache=True would otherwise be
+        # honoured and fail with a device mismatch as the cache follows nothing.
         if self.offloaded:
-            kwargs.setdefault('use_cache', False)
+            if kwargs.get('use_cache'):
+                self._log("use_cache is not supported with CPU offload "
+                          "(the KV-cache can't follow layers evicted to CPU); "
+                          "disabling it for this call.")
+            kwargs['use_cache'] = False
 
         # Generate
         generate_kwargs = {
@@ -209,7 +215,11 @@ class AtlasInference:
         self._log("Step 1/3: Profiling layer sensitivities end-to-end...")
         if self.device.type == 'cuda':
             self.model.to(self.device)
-        profiler = SensitivityProfiler()
+        # Profile the *same* quantizer the model will be deployed with: with the
+        # fused kernel enabled the layers are per-channel symmetric (W8A16/W4A16),
+        # whose per-layer error differs from the eager block-wise + outlier path,
+        # so profiling the wrong one would make the DP allocate against stale costs.
+        profiler = SensitivityProfiler(use_kernel=self.use_kernel)
         profiles = profiler.profile_end_to_end(self.model, tokenizer=self.tokenizer)
         if self.device.type == 'cuda':
             self.model.to('cpu')

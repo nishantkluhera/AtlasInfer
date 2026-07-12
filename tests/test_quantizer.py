@@ -109,6 +109,100 @@ class TestQuantizer:
             recon_val = recon_flat[idx].item()
             assert abs(orig_val - recon_val) < 1e-3, f"Outlier not preserved at {idx}"
     
+    def test_masked_outlier_cluster_is_caught(self):
+        """Regression: a cluster of co-located large weights must be caught.
+
+        A single spike is caught by either estimator (its z-score is bounded by
+        (N-1)/sqrt(N) ~ 7.9-11.2 for N=64-128, far above a 3-sigma cut), so a
+        lone-spike test would pass under the old mean/std detector too and guard
+        nothing. The case mean/std actually misses is *masking*: several
+        comparably large weights in one block inflate the mean/std together and
+        pull each other's z-scores under the threshold. The robust median/MAD
+        detector must still flag the whole cluster.
+        """
+        from atlasinfer.quantizer import _find_outliers
+
+        block = torch.full((1, 64), 0.05)
+        idx = list(range(0, 8))          # 8/64 co-located spikes -> mean/std masks
+        for i in idx:
+            block[0, i] = 50.0
+
+        # First assert this configuration really does mask under mean/std (z < 3.0
+        # at every spike), so the test exercises the failure mode it claims and
+        # would fail against the old detector.
+        mean = block.mean(dim=1, keepdim=True)
+        std = block.std(dim=1, keepdim=True).clamp(min=1e-6)
+        z_meanstd = (block - mean).abs() / std
+        assert not bool((z_meanstd[0, idx] > 3.0).any()), \
+            "test no longer exercises masking: mean/std already catches these"
+
+        # The robust detector catches the whole masked cluster (8/64 < the 25% cap).
+        mask = _find_outliers(block, threshold=3.0)
+        assert bool(mask[0, idx].all()), "robust detector missed a masked cluster"
+
+        recon = dequantize_tensor(
+            quantize_tensor(block, block_size=64, outlier_threshold=3.0)
+        ).reshape(-1)
+        for i in idx:
+            assert abs(recon[i].item() - 50.0) < 1e-2, "clustered outlier not preserved"
+
+    def test_degenerate_block_does_not_mass_flag(self):
+        """A >=50%-constant/sparse block must not dump its whole minority into FP16.
+
+        MAD collapses to 0 on a majority-constant block, so without the per-block
+        outlier-fraction cap every differing element gets flagged (compression
+        inverted). A lone spike, being a tiny fraction, must still be caught.
+        """
+        from atlasinfer.quantizer import _find_outliers
+
+        sparse = torch.zeros(1, 64)
+        sparse[0, :20] = torch.randn(20)  # 44/64 exact zeros -> MAD == 0
+        assert int(_find_outliers(sparse, 3.0).sum()) == 0, "degenerate block mass-flagged"
+
+        spike = torch.full((1, 64), 0.05)
+        spike[0, 32] = 100.0
+        m = _find_outliers(spike, 3.0)
+        assert bool(m[0, 32]) and int(m.sum()) == 1, "lone spike must still be caught, alone"
+
+    def test_clean_weights_stay_compressed(self):
+        """The robust detector must not over-flag clean Gaussian weights.
+
+        Guards the calibration constant in ``_find_outliers``: the asymptotic
+        MAD->sigma factor over-flags at small block sizes and would erode INT4
+        compression below the INT8 line. On clean weights outliers stay ~1%.
+        """
+        from atlasinfer.quantizer import _find_outliers
+
+        torch.manual_seed(0)
+        blocks = torch.randn(4000, 64)
+        frac = _find_outliers(blocks, threshold=2.5).float().mean().item()
+        assert frac < 0.02, f"robust detector over-flags clean weights: {frac:.3%}"
+
+    def test_padded_tail_block_not_mass_flagged(self):
+        """A zero-padded tail block must not turn its real weights into outliers.
+
+        When numel isn't block-aligned the final block is mostly padding zeros;
+        left in the stats its median/MAD collapse to ~0 and every ordinary weight
+        in it scores as an outlier (compression wasted on sparse FP16). Passing
+        num_valid excludes the padding, so a clean tensor with no true outliers
+        flags essentially none regardless of alignment.
+        """
+        from atlasinfer.quantizer import _find_outliers, quantize_tensor, dequantize_tensor
+
+        torch.manual_seed(0)
+        t = torch.randn(128 * 3 + 10) * 0.02  # tail block: 10 real + 118 padding
+        qt = quantize_tensor(t, block_size=128, outlier_threshold=3.0)
+        # Only a couple genuine tail-of-Gaussian flags in the full blocks; nowhere
+        # near the whole 10-weight tail (which the padding-blind detector flagged).
+        assert qt.outlier_indices.numel() <= 3, \
+            f"padded tail over-flagged: {qt.outlier_indices.numel()} outliers"
+        assert (dequantize_tensor(qt).float() - t).abs().max().item() < 1e-2
+
+        # Directly: no flags fall inside the padded tail region.
+        blocks = torch.nn.functional.pad(t.float(), (0, 128 - (t.numel() % 128))).view(-1, 128)
+        mask = _find_outliers(blocks, 3.0, num_valid=t.numel())
+        assert int(mask[-1, 10:].sum()) == 0, "padding flagged as outliers"
+
     def test_compression_ratio(self):
         """INT8 with sparse outliers must actually shrink the tensor.
 

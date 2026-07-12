@@ -2,9 +2,13 @@
 AtlasInfer Quantizer - block-wise integer quantization with sparse outliers.
 
 Weights are quantized to symmetric 8-bit or 4-bit integers using per-block
-scales. A small set of high-magnitude "outlier" weights (detected per block by
-z-score) are kept in FP16 so the few values that dominate a layer's output are
-not crushed by the low-bit grid.
+scales. A small set of high-magnitude "outlier" weights (detected per block by a
+robust median/MAD z-score) are kept in FP16 so the few values that dominate a
+layer's output are not crushed by the low-bit grid. The detector is robust on
+purpose: when a block holds several comparably large weights they inflate a plain
+mean/std together and mask one another below the threshold, whereas median/MAD
+tolerates up to ~50% such contamination and still flags them (see
+``_find_outliers``).
 
 Outliers are stored *sparsely* - as (index, value) pairs into the flattened
 tensor - rather than as a dense boolean mask. Because typical outlier rates are
@@ -22,6 +26,14 @@ import torch
 # Symmetric integer ranges. INT8 fits [-127, 127]; INT4 uses a symmetric [-7, 7].
 INT8_MAX = 127.0
 INT4_MAX = 7.0
+
+# Sanity cap on the per-block outlier rate. Outliers are meant to be rare (well
+# under a few percent); a block that wants to flag more than this is either
+# degenerate (>=50% identical / padded / pruned, so its robust spread collapsed)
+# or just genuinely wide — either way, pulling that many values out into sparse
+# FP16 would invert the compression, so we flag nothing there and quantize the
+# block normally. See ``_find_outliers``.
+_MAX_OUTLIER_FRACTION = 0.25
 
 # Legacy aliases.
 FP8_MAX, FP8_MIN = INT8_MAX, -INT8_MAX
@@ -76,12 +88,76 @@ class QuantizedTensor(NamedTuple):
         )
 
 
-def _find_outliers(blocks: torch.Tensor, threshold: float) -> torch.Tensor:
-    """Boolean per-block mask of elements exceeding ``threshold`` std devs."""
-    means = blocks.mean(dim=1, keepdim=True)
-    stds = torch.clamp(blocks.std(dim=1, keepdim=True), min=1e-6)
-    z = torch.abs((blocks - means) / stds)
-    return z > threshold
+def _find_outliers(
+    blocks: torch.Tensor, threshold: float, num_valid: Optional[int] = None
+) -> torch.Tensor:
+    """Boolean per-block mask of elements ``threshold`` robust std-devs from center.
+
+    Uses a **median / MAD** z-score rather than mean / std. Mean and standard
+    deviation have a breakdown point of zero, so a *cluster* of comparably large
+    weights inflates the block's std enough to pull each member's z-score back
+    under the threshold — the classic *masking* effect — and the spikes this
+    sparse-outlier path exists to rescue evade detection together. (A *single*
+    spike is not the problem: its studentized deviation is bounded by
+    ``(N-1)/sqrt(N)`` ~ 7.9-11.2 for the N=64-128 blocks we use, far above a
+    3-sigma cut, so either estimator catches a lone one; it's several co-located
+    spikes that mean/std misses.) The median and the median-absolute-deviation
+    tolerate up to ~50% contamination, so the whole cluster is caught instead.
+
+    That robustness has a failure mode of its own: when a block is >=50% identical
+    (a pruned/sparse block of mostly zeros, or otherwise near-constant) the MAD
+    collapses to 0 and *every* differing element scores as an outlier. More
+    generally, any block where the mask covers a large fraction is one where
+    pulling that fraction out into sparse FP16 would invert the compression the
+    outlier path exists for — whether the block is degenerate or just genuinely
+    wide, plain per-block quantization is the better call there. So a per-block
+    outlier-fraction cap (:data:`_MAX_OUTLIER_FRACTION`) drops the mask for any
+    block flagging more than that fraction; a real spike is a tiny fraction and
+    stays under the cap, so lone/rare outliers are preserved. Note this also
+    means a genuine spike sharing a *degenerate* block with a large secondary
+    mass is deliberately left in-line (quantized normally) rather than extracted
+    — the block is quantized as a whole, by design.
+
+    ``num_valid``: when the flattened tensor was zero-padded up to a whole number
+    of blocks, the count of real (non-padding) elements. The trailing padding
+    lives entirely in the final block; left in, a mostly-padding tail block would
+    have its median and MAD collapse to ~0 and flag its handful of *ordinary*
+    weights as spurious outliers. So the final block's center/spread are computed
+    from its real elements only, and padding positions are never flagged.
+    """
+    block_size = blocks.shape[1]
+    n_pad = (blocks.numel() - num_valid) if num_valid is not None else 0
+
+    median = blocks.median(dim=1, keepdim=True).values
+    if n_pad > 0:  # recompute the padded tail block's center from real elements
+        real = blocks[-1, : block_size - n_pad]
+        median[-1, 0] = real.median()
+
+    dev = torch.abs(blocks - median)
+    mad = dev.median(dim=1, keepdim=True).values
+    if n_pad > 0:  # ...and its spread, so trailing zeros don't shrink the MAD
+        real = blocks[-1, : block_size - n_pad]
+        mad[-1, 0] = (real - median[-1, 0]).abs().median()
+
+    # sigma_hat = MAD / k. The asymptotic constant is k = Phi^{-1}(0.75) = 0.6745
+    # (so `threshold` reads in sigma units), but sample MAD is downward-biased at
+    # small block sizes, which would make sigma_hat too small and roughly double
+    # the fraction flagged on clean weights (eroding compression). k = 0.60 is
+    # calibrated so the flagged fraction on clean Gaussian blocks at the sizes we
+    # use (64-128) matches the intended ~1% at threshold 2.5-3.0, while masked
+    # clusters (the ones mean/std lets hide) are still caught. Clamp so a
+    # (near-)constant block doesn't divide by ~0 and flag everything.
+    robust_std = torch.clamp(mad / 0.60, min=1e-6)
+    z = dev / robust_std
+    mask = z > threshold
+    if n_pad > 0:  # padding is an artifact, never an outlier
+        mask[-1, block_size - n_pad :] = False
+    # Drop the mask when it covers too much of a block (see docstring): flagging
+    # more than _MAX_OUTLIER_FRACTION means the block is degenerate or genuinely
+    # wide, and extracting that many values as sparse FP16 would invert the
+    # compression, so quantize it normally instead.
+    keep = mask.float().mean(dim=1, keepdim=True) <= _MAX_OUTLIER_FRACTION
+    return mask & keep
 
 
 def _quantize_core(tensor: torch.Tensor, block_size: int, int_max: float, threshold: float):
@@ -95,7 +171,7 @@ def _quantize_core(tensor: torch.Tensor, block_size: int, int_max: float, thresh
         flat = torch.nn.functional.pad(flat, (0, padded - num_elements))
     blocks = flat.view(-1, block_size)
 
-    outlier_blocks = _find_outliers(blocks, threshold)
+    outlier_blocks = _find_outliers(blocks, threshold, num_valid=num_elements)
 
     # Compute scales from non-outlier magnitudes so a single spike can't blow
     # out the whole block's resolution.
@@ -304,7 +380,7 @@ def quantize_tensor_nf4(
         flat = torch.nn.functional.pad(flat, (0, padded - num_elements))
     blocks = flat.view(-1, block_size)
 
-    outlier_blocks = _find_outliers(blocks, outlier_threshold)
+    outlier_blocks = _find_outliers(blocks, outlier_threshold, num_valid=num_elements)
     clean = blocks.clone()
     clean[outlier_blocks] = 0.0
     absmax = clean.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)

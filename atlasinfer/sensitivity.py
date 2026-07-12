@@ -25,6 +25,28 @@ from .linear import create_quantized_linear
 # Default precisions the profiler measures (besides the implicit lossless fp16).
 DEFAULT_PRECISIONS = ("int8", "int4")
 
+# Penalty assigned to a layer the profiler couldn't measure. Large and
+# quality-ordered so the allocator keeps such a layer at FP16 whenever the budget
+# allows (and prefers INT8 over INT4 if it's forced to quantize it) rather than
+# silently trusting a fabricated mid-range error.
+_FAILED_PROFILE_PENALTY = 1e6
+
+
+def _failed_profile_errors(precisions: tuple) -> Dict[str, float]:
+    """Per-precision errors that force an unmeasurable layer toward FP16.
+
+    Penalty scales inversely with bytes-per-param, so a more aggressive precision
+    always carries a larger penalty regardless of the order ``precisions`` is
+    given in (the allocator then prefers the least-aggressive tier if it's forced
+    to quantize the layer at all). Deriving from bytes avoids assuming the tuple
+    is quality-ordered.
+    """
+    from .allocator import BYTES_PER_PARAM
+    return {
+        p: _FAILED_PROFILE_PENALTY / BYTES_PER_PARAM.get(p, 2.0)
+        for p in precisions
+    }
+
 # Linear layers we never quantize (numerically delicate / tiny relative to model).
 DEFAULT_EXCLUDE = ("embed", "lm_head", "norm", "ln_", "layernorm")
 
@@ -100,6 +122,8 @@ class SensitivityProfiler:
         max_rows: int = 64,
         max_samples: int = 8,
         seq_len: int = 128,
+        use_kernel: bool = False,
+        quant_4bit: str = "nf4",
     ):
         """
         Args:
@@ -108,12 +132,23 @@ class SensitivityProfiler:
             max_rows: Cap on captured activation rows per layer (controls cost).
             max_samples: Number of calibration sequences to run.
             seq_len: Max tokens per calibration sequence.
+            use_kernel: Profile the *fused-kernel* layers (``W8A16``/``W4A16``:
+                per-channel symmetric) instead of the eager block-wise + outlier
+                layers. Must match what the model will actually be quantized to,
+                or the allocator optimizes against the wrong per-layer errors —
+                the two schemes differ (e.g. INT8's error is ~10x higher under
+                the per-channel kernel than under block-wise + outliers).
+            quant_4bit: 4-bit scheme for the eager path (``"nf4"`` or ``"int4"``);
+                ignored when ``use_kernel`` (the kernel path is always per-channel
+                symmetric int4).
         """
         self.precisions = tuple(precisions)
         self.exclude_patterns = tuple(p.lower() for p in exclude_patterns)
         self.max_rows = max_rows
         self.max_samples = max_samples
         self.seq_len = seq_len
+        self.use_kernel = use_kernel
+        self.quant_4bit = quant_4bit
 
     def _target_layers(self, model: nn.Module) -> Dict[str, nn.Module]:
         targets = {}
@@ -176,20 +211,29 @@ class SensitivityProfiler:
         self,
         module: nn.Module,
         activations: torch.Tensor,
-        device: torch.device,
     ) -> Dict[str, float]:
-        """Relative output error of ``module`` at each target precision."""
+        """Relative output error of ``module`` at each target precision.
+
+        Runs on the module's *own* device: under a multi-device ``device_map`` a
+        target layer can live on another GPU, and forcing its activations onto the
+        model's primary device would mismatch.
+        """
         errors: Dict[str, float] = {}
-        act = activations.to(device)
+        mdev = next(module.parameters()).device
+        act = activations.to(mdev)
 
         with torch.no_grad():
-            ref_module = module.to(device)
-            ref_out = ref_module(act.to(next(ref_module.parameters()).dtype)).float()
+            # Reference output from the original module (read-only here, so no
+            # need to copy or move it — just align the activations' dtype).
+            ref_out = module(act.to(next(module.parameters()).dtype)).float()
             ref_norm = ref_out.norm() + 1e-8
 
             for precision in self.precisions:
-                qlayer = create_quantized_linear(deepcopy(module), precision=precision)
-                qlayer = qlayer.to(device)
+                qlayer = create_quantized_linear(
+                    deepcopy(module), precision=precision,
+                    use_kernel=self.use_kernel, quant_4bit=self.quant_4bit,
+                )
+                qlayer = qlayer.to(mdev)
                 q_out = qlayer(act).float()
                 rel = ((ref_out - q_out).norm() / ref_norm).item()
                 errors[precision] = rel
@@ -214,16 +258,16 @@ class SensitivityProfiler:
 
         activations = self._capture_activations(model, targets, input_batches)
 
-        device = next(model.parameters()).device
         profiles: Dict[str, LayerProfile] = {}
         for name, module in targets.items():
             if name not in activations:
                 continue
             try:
-                errors = self._measure_layer(module, activations[name], device)
+                errors = self._measure_layer(module, activations[name])
             except Exception as exc:  # pragma: no cover - defensive
-                print(f"Warning: could not profile layer {name}: {exc}")
-                errors = {p: 0.5 for p in self.precisions}
+                print(f"Warning: could not profile layer {name}: {exc}. "
+                      f"Forcing it to FP16 (kept out of quantization).")
+                errors = _failed_profile_errors(self.precisions)
             profiles[name] = LayerProfile(
                 name=name, param_count=_param_count(module), errors=errors
             )
@@ -274,10 +318,18 @@ class SensitivityProfiler:
         profiles: Dict[str, LayerProfile] = {}
         for name, module in targets.items():
             parent, attr = self._parent_and_attr(model, name)
+            # Swap the layer in on its *own* device: under a multi-device
+            # device_map the target can live on another GPU, and pinning the
+            # replacement to the model's primary device would device-mismatch
+            # mid-forward (silently caught below and mis-scored as unprofilable).
+            mdev = next(module.parameters()).device
             errors: Dict[str, float] = {}
             try:
                 for precision in self.precisions:
-                    qlayer = create_quantized_linear(deepcopy(module), precision=precision).to(device)
+                    qlayer = create_quantized_linear(
+                        deepcopy(module), precision=precision,
+                        use_kernel=self.use_kernel, quant_4bit=self.quant_4bit,
+                    ).to(mdev)
                     setattr(parent, attr, qlayer)
                     nll = self._calibration_loss(model, batches, device)
                     errors[precision] = max(0.0, nll - base_nll)
@@ -285,8 +337,9 @@ class SensitivityProfiler:
                     del qlayer
             except Exception as exc:  # pragma: no cover - defensive
                 setattr(parent, attr, module)
-                print(f"Warning: could not profile layer {name}: {exc}")
-                errors = {p: 0.5 for p in self.precisions}
+                print(f"Warning: could not profile layer {name}: {exc}. "
+                      f"Forcing it to FP16 (kept out of quantization).")
+                errors = _failed_profile_errors(self.precisions)
             profiles[name] = LayerProfile(
                 name=name, param_count=_param_count(module), errors=errors
             )

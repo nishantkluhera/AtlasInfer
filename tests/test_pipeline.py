@@ -144,6 +144,36 @@ class TestKernelBackend:
         assert out.shape == ref.shape
         assert not torch.isnan(out).any()
 
+    def test_profiler_measures_deployed_scheme(self):
+        """Regression: profiler(use_kernel=True) must measure the per-channel
+        kernel quantizer it will deploy, not the eager block+outlier proxy.
+
+        Otherwise the allocator optimizes against a different (usually more
+        optimistic) error than the model actually incurs at runtime.
+        """
+        from copy import deepcopy
+        from atlasinfer.linear import create_quantized_linear
+
+        torch.manual_seed(0)
+        lin = nn.Linear(256, 256, bias=False)
+        lin.weight.data *= 0.02
+        act = torch.randn(64, 256)
+
+        prof = SensitivityProfiler(precisions=("int8",), use_kernel=True)
+        measured = prof._measure_layer(deepcopy(lin), act)["int8"]
+
+        # Ground truth: error of the layer that would actually be deployed.
+        deployed = create_quantized_linear(deepcopy(lin), precision="int8", use_kernel=True)
+        ref = lin(act)
+        deployed_err = ((ref - deployed(act)).norm() / ref.norm()).item()
+        assert abs(measured - deployed_err) < 1e-4, \
+            f"profiler {measured} != deployed {deployed_err}"
+
+        # And it must differ from the eager proxy (else the fix is a no-op).
+        eager = SensitivityProfiler(precisions=("int8",), use_kernel=False)
+        eager_err = eager._measure_layer(deepcopy(lin), act)["int8"]
+        assert abs(eager_err - deployed_err) > 1e-5
+
     def test_mixed_with_kernel_backend(self):
         from atlasinfer.triton_kernels import W8A16Linear, W4A16Linear
 
@@ -155,6 +185,42 @@ class TestKernelBackend:
         info = get_model_info(model)
         assert info["w8a16_kernel_count"] == 1 and info["w4a16_kernel_count"] == 1
         assert not torch.isnan(model(torch.randint(0, 64, (1, 16))).logits).any()
+
+
+class TestProfilerFailureHandling:
+    def test_unprofilable_layer_forced_to_fp16(self, monkeypatch):
+        """A layer the profiler can't measure must be penalized toward FP16, not
+        handed a fabricated 0.5 the allocator would then trust and quantize."""
+        import atlasinfer.sensitivity as sens
+
+        model = TinyLM().eval()
+        profiler = SensitivityProfiler(max_samples=4, seq_len=32)
+
+        # Force every per-layer quantization attempt to blow up.
+        def boom(*a, **k):
+            raise RuntimeError("simulated profiling failure")
+        monkeypatch.setattr(sens, "create_quantized_linear", boom)
+
+        profiles = profiler.profile_end_to_end(model)
+        for prof in profiles.values():
+            # Penalties are large and ordered (INT4 worse than INT8).
+            assert prof.errors["int8"] >= sens._FAILED_PROFILE_PENALTY
+            assert prof.errors["int4"] > prof.errors["int8"]
+
+        # With a generous budget the allocator keeps the unmeasurable layers FP16.
+        n_params = sum(p.param_count for p in profiles.values())
+        alloc = allocate_optimal(profiles, budget_bytes=n_params * 2)  # room for all-FP16
+        assert all(p == "fp16" for p in alloc.allocations.values())
+
+    def test_failed_penalty_is_order_independent(self):
+        """Penalty must depend on the precision, not its position in the tuple:
+        int4 (more aggressive) always outranks int8, either order given."""
+        from atlasinfer.sensitivity import _failed_profile_errors
+
+        a = _failed_profile_errors(("int8", "int4"))
+        b = _failed_profile_errors(("int4", "int8"))
+        assert a == b
+        assert a["int4"] > a["int8"]  # more aggressive => larger penalty
 
 
 class TestOffloadHelpers:
