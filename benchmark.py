@@ -113,12 +113,28 @@ def evaluate_perplexity(
 # Data
 # --------------------------------------------------------------------------- #
 def load_wikitext():
-    """Return (calibration_texts, eval_text) from WikiText-2."""
+    """Return (calibration_texts, eval_text) from WikiText-2.
+
+    The dataset id is tried both bare and namespaced: newer huggingface_hub /
+    datasets reject the legacy bare ``"wikitext"`` id (it must be
+    ``namespace/name``), while older stacks only know the bare id. Same content
+    either way, so numbers stay comparable across environments.
+    """
     from datasets import load_dataset
-    test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+
+    def _load(split):
+        last = None
+        for repo in ("wikitext", "Salesforce/wikitext"):
+            try:
+                return load_dataset(repo, "wikitext-2-raw-v1", split=split)
+            except Exception as exc:  # noqa: BLE001 - id/URI schemes differ by version
+                last = exc
+        raise last
+
+    test = _load("test")
     eval_text = "\n\n".join(t for t in test["text"] if t.strip())
 
-    train = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    train = _load("train")
     # Plenty of calibration docs: the sensitivity profiler caps at its own
     # max_samples (8), while GPTQ consumes many more for a well-conditioned Hessian.
     calib = [t for t in train["text"] if len(t.strip()) > 200][:256]
