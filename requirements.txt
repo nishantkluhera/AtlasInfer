@@ -15,3 +15,10 @@ matplotlib
 
 # Testing (dev)
 pytest>=7.0.0
+
+# --- Optional, Linux/CUDA-only extras (not installed by default) -------------
+# External quant baselines for compare_baselines.py — `pip install -e ".[baselines]"`
+#   bitsandbytes optimum gptqmodel autoawq
+# Downstream zero-shot accuracy for eval_downstream.py — `pip install -e ".[eval]"`
+#   lm-eval>=0.4.0
+# The harnesses guard these imports and skip cleanly if they're absent.

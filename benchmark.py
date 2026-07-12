@@ -266,7 +266,12 @@ def main():
     ap.add_argument("--out", default="results", help="Output directory")
     ap.add_argument("--device-map", action="store_true",
                     help="shard across all GPUs (device_map=auto) for big models, e.g. on Kaggle T4x2")
+    ap.add_argument("--seed", type=int, default=0, help="RNG seed (reproducibility)")
     args = ap.parse_args()
+
+    from atlasinfer import seed_everything
+    seed_everything(args.seed)
+    print(f"seed={args.seed}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     results = run(args.model, args.eval_tokens, args.bits, device, device_map=args.device_map)

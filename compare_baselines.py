@@ -1,19 +1,34 @@
 """
-Head-to-head: AtlasInfer vs bitsandbytes (the de-facto accessible-quantization
-baseline) on the same model and the same WikiText-2 eval.
+Head-to-head: AtlasInfer vs the standard 4-bit quantization stack on the same
+model and the same WikiText-2 eval.
 
 Methods compared:
   * fp16                  - dense baseline
   * AtlasInfer int8/int4  - uniform block-wise + sparse outliers (eager path)
+  * AtlasInfer gptq-nf4   - GPTQ error-compensated NF4 (AtlasInfer's best 4-bit)
   * AtlasInfer mixed      - sensitivity-allocated per-layer precision (the point)
   * bnb int8 (LLM.int8()) - bitsandbytes 8-bit
   * bnb nf4               - bitsandbytes 4-bit NormalFloat
+  * gptq (auto-gptq)      - the reference GPTQ-INT4 (via transformers GPTQConfig)
+  * awq   (autoawq)       - Activation-aware Weight Quantization INT4
+
+The last two are the *real* SOTA-tier 4-bit baselines (not just the accessible
+bitsandbytes path); they're optional and skipped with a clear note if their
+libraries aren't installed, so the script still runs a full comparison against
+whatever baselines are present.
 
 Memory is measured method-agnostically as the total bytes of all parameters +
 buffers actually resident on the model, so every method is counted the same way.
+NOTE: memory is not perfectly apples-to-apples across *methods* - e.g. bnb and
+gptq/awq pack scales/zeros differently and bnb double-quantizes its scales - so
+read the memory column as "same accounting rule, method-specific packing", and
+the perplexity column (identical eval for all) as the primary axis.
 
-Run under Linux/WSL2 + CUDA (bitsandbytes is Linux-only):
-    ~/atlasvenv/bin/python compare_baselines.py --model EleutherAI/pythia-410m
+Run under Linux/WSL2 + CUDA (bitsandbytes/auto-gptq/awq are Linux-only):
+    python compare_baselines.py --model EleutherAI/pythia-410m
+    python compare_baselines.py --model Qwen/Qwen2.5-0.5B --skip awq   # skip a slow/absent one
+Install the external baselines with:
+    pip install -e ".[baselines]"
 """
 import argparse
 import gc
@@ -41,6 +56,36 @@ def resident_bytes(model) -> int:
     return total
 
 
+def gptq_baseline(model_name, tokenizer, calib, device_map):
+    """Reference GPTQ-INT4 via transformers' GPTQConfig (optimum + auto-gptq).
+
+    Quantizes on load using the same WikiText calibration docs AtlasInfer's GPTQ
+    path uses, so it's a like-for-like 4-bit comparison of the error-compensation
+    machinery rather than a different calibration set.
+    """
+    from transformers import GPTQConfig
+    calib_docs = [t for t in calib if t.strip()][:128]
+    qc = GPTQConfig(bits=4, dataset=calib_docs, tokenizer=tokenizer,
+                    group_size=128, desc_act=False)
+    return AutoModelForCausalLM.from_pretrained(
+        model_name, quantization_config=qc, dtype=torch.float16,
+        device_map=("auto" if device_map else {"": 0}))
+
+
+def awq_baseline(model_name, tokenizer):
+    """Activation-aware Weight Quantization INT4 via autoawq.
+
+    Returns the underlying transformers model (``.model``) so perplexity and
+    resident-bytes accounting go through the exact same code path as every other
+    method.
+    """
+    from awq import AutoAWQForCausalLM
+    m = AutoAWQForCausalLM.from_pretrained(model_name, dtype=torch.float16)
+    m.quantize(tokenizer, quant_config={
+        "w_bit": 4, "q_group_size": 128, "zero_point": True, "version": "GEMM"})
+    return m.model
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", "-m", default="EleutherAI/pythia-410m")
@@ -49,7 +94,14 @@ def main():
     ap.add_argument("--device-map", action="store_true",
                     help="shard across all GPUs (device_map=auto) for models too big "
                          "for one card, e.g. 7-13B on Kaggle T4x2")
+    ap.add_argument("--seed", type=int, default=0, help="RNG seed (reproducibility)")
+    ap.add_argument("--skip", nargs="*", default=[],
+                    help="method keys to skip, e.g. --skip awq gptq (for slow/absent baselines)")
     args = ap.parse_args()
+
+    from atlasinfer import seed_everything
+    seed_everything(args.seed)
+    print(f"seed={args.seed}")
 
     assert torch.cuda.is_available(), "needs CUDA"
     dev = torch.device("cuda")
@@ -125,13 +177,46 @@ def main():
             bnb_4bit_compute_dtype=torch.float16))
     record("bnb nf4", bnb4, 4)
 
-    # Markdown table.
+    # External SOTA-tier 4-bit baselines (optional). Each is guarded: a missing
+    # library or a version/runtime failure prints a SKIPPED note and the rest of
+    # the comparison continues, so you always get whatever baselines are present.
+    def external(key, label, fn):
+        if key in args.skip:
+            print(f"  {label:<22} SKIPPED (--skip {key})")
+            return
+        try:
+            record(label, fn(), 4)
+        except ImportError as exc:
+            print(f"  {label:<22} SKIPPED (not installed: {exc}. "
+                  f"`pip install -e \".[baselines]\"`)")
+        except Exception as exc:  # noqa: BLE001 - baseline libs are version-fragile
+            print(f"  {label:<22} SKIPPED (failed: {type(exc).__name__}: {exc})")
+            gc.collect(); torch.cuda.empty_cache()
+
+    external("gptq", "gptq (auto-gptq)",
+             lambda: gptq_baseline(args.model, tok, calib, args.device_map))
+    external("awq", "awq (autoawq)",
+             lambda: awq_baseline(args.model, tok))
+
+    # Markdown table (stdout + a reproducible file under results/).
     fp16_ppl = next(r["ppl"] for r in rows if r["method"] == "fp16")
-    print("\n| Method | ~bits | Weights (MB) | Perplexity | delta vs FP16 |")
-    print("| --- | ---: | ---: | ---: | ---: |")
-    for r in rows:
-        print(f"| {r['method']} | {r['bits']} | {r['mb']:.1f} | "
-              f"{r['ppl']:.3f} | {r['ppl'] - fp16_ppl:+.3f} |")
+    header = (f"### {args.model}  (WikiText-2, {args.eval_tokens} eval tokens, seed {args.seed})\n\n"
+              "| Method | ~bits | Weights (MB) | Perplexity | delta vs FP16 |\n"
+              "| --- | ---: | ---: | ---: | ---: |")
+    body = "\n".join(
+        f"| {r['method']} | {r['bits']} | {r['mb']:.1f} | "
+        f"{r['ppl']:.3f} | {r['ppl'] - fp16_ppl:+.3f} |"
+        for r in rows
+    )
+    table = header + "\n" + body + "\n"
+    print("\n" + table)
+
+    os.makedirs("results", exist_ok=True)
+    safe = args.model.replace("/", "_")
+    out = os.path.join("results", f"comparison_{safe}.md")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(table)
+    print(f"Wrote {out}")
 
 
 if __name__ == "__main__":

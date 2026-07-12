@@ -36,6 +36,7 @@ from .triton_kernels import (
     quantize_w8a16, quantize_w4a16,
 )
 from .gptq import gptq_quantize_nf4, quantize_model_gptq
+from .reproducibility import seed_everything
 from .inference import AtlasInference
 
 __all__ = [
@@ -61,6 +62,8 @@ __all__ = [
     "quantize_w8a16", "quantize_w4a16",
     # GPTQ
     "gptq_quantize_nf4", "quantize_model_gptq",
+    # Reproducibility
+    "seed_everything",
     # Inference
     "AtlasInference",
 ]

@@ -28,6 +28,12 @@ dependencies = [
 benchmark = ["datasets", "matplotlib"]
 dev = ["pytest>=7.0.0"]
 kernel = ["triton>=3.0"]  # fused W8A16 kernel; Linux/WSL2 only
+# External quant baselines for compare_baselines.py (Linux/CUDA only, version-
+# fragile — the harness skips any that fail to import). gptqmodel is the
+# maintained GPTQ backend transformers' GPTQConfig dispatches to.
+baselines = ["bitsandbytes", "optimum", "gptqmodel", "autoawq"]
+# Downstream zero-shot accuracy (eval_downstream.py).
+eval = ["lm-eval>=0.4.0"]
 
 [project.scripts]
 atlasinfer = "atlasinfer.inference:main"

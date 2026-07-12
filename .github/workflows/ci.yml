@@ -26,7 +26,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[dev]"
+          pip install -e ".[dev,benchmark]"
+
+      - name: Byte-compile all sources (syntax check, incl. benchmark harnesses)
+        run: python -m compileall -q atlasinfer benchmark.py compare_baselines.py eval_downstream.py bench_latency.py reproduce.py
+
+      - name: Import smoke test (harness modules load without a GPU)
+        run: python -c "import atlasinfer, benchmark, compare_baselines, eval_downstream, reproduce; print('imports OK')"
 
       - name: Run tests
         run: pytest tests/ -v

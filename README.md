@@ -67,7 +67,10 @@ Weights are quantized with a separate scale per 64–128 element block: symmetri
 INT8 for the 8-bit tier, and **NF4** (NormalFloat — a 16-level codebook matched
 to the Gaussian distribution of weights, from QLoRA) for the 4-bit tier, with
 symmetric INT4 also available. The handful of high-magnitude "outlier" weights
-that dominate a layer's output (detected per block by z-score) are kept in FP16
+that dominate a layer's output (detected per block by a **robust median/MAD
+z-score** — when a block holds several comparably large weights they inflate a
+plain mean/std together and mask one another under the threshold, whereas
+median/MAD tolerates that contamination and still flags them) are kept in FP16
 and stored **sparsely** as `(index, value)` pairs — a dense boolean mask would
 cost a full byte per weight and wipe out the savings.
 
@@ -365,13 +368,30 @@ per-layer allocation visualization shown above.
 
 ## Run the benchmarks
 
+Every harness is seeded (`--seed 0`, deterministic kernels) and writes its table
++ JSON under `results/`, so a number is reproducible run-to-run on the same
+hardware.
+
 ```bash
+# 1. Perplexity / memory sweep (uniform + mixed).
 python benchmark.py --model Qwen/Qwen3-0.6B-Base --eval-tokens 40000 --bits 4.5 5 6 7
-python compare_baselines.py --model Qwen/Qwen2.5-0.5B   # head-to-head vs bitsandbytes
+
+# 2. Head-to-head vs the 4-bit stack: bitsandbytes + real GPTQ (auto-gptq) + AWQ.
+pip install -e ".[baselines]"
+python compare_baselines.py --model Qwen/Qwen2.5-0.5B
+
+# 3. Downstream zero-shot accuracy (ARC / HellaSwag / PIQA / WinoGrande), not just perplexity.
+pip install -e ".[eval]"
+python eval_downstream.py --model Qwen/Qwen2.5-0.5B --limit 1000
+
+# ...or all three, for several models, in one command:
+python reproduce.py --models gpt2 Qwen/Qwen2.5-0.5B Qwen/Qwen3-0.6B-Base
 ```
 
-Outputs a markdown table, a JSON dump, and a perplexity-vs-memory figure under
-`results/`.
+The external baselines (`auto-gptq`/`gptqmodel`, `autoawq`) and `lm-eval` are
+Linux/CUDA-only and version-fragile; each harness **skips any that fail to
+import** with a clear note, so a partial install still produces a full table of
+whatever's present.
 
 ### Bigger models (7–13B) on a free Kaggle GPU
 
