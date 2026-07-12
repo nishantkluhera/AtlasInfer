@@ -32,6 +32,7 @@ import os
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import torch
+import torch.nn as nn
 
 # Windows/CUDA stability: init the CUDA context before importing transformers
 # (see benchmark.py for the full note — avoids a 0xC0000005 access violation on
@@ -47,11 +48,50 @@ from atlasinfer.patcher import quantize_model, quantize_model_mixed
 from atlasinfer.sensitivity import SensitivityProfiler
 from atlasinfer.allocator import allocate_optimal
 from atlasinfer.gptq import quantize_model_gptq
+from atlasinfer.linear import QuantizedLinear, QuantizedLinear4bit
+from atlasinfer.quantizer import (
+    dequantize_tensor, dequantize_tensor_nf4, dequantize_tensor_fp4,
+)
 from benchmark import load_wikitext, model_weight_bytes
 
 hf_logging.set_verbosity_error()
 
 DEFAULT_TASKS = ["arc_easy", "arc_challenge", "hellaswag", "piqa", "winogrande"]
+
+
+@torch.no_grad()
+def densify_for_eval(model: nn.Module) -> nn.Module:
+    """Bake each eager quantized layer's dequantized weights into a dense Linear.
+
+    The eager ``QuantizedLinear`` forward dequantizes its block-wise INT8/NF4
+    weights (+ FP16 outliers) to a full FP16 weight and calls ``F.linear`` on
+    *every* matmul — correct but ~15x slower than FP16, which makes a full-set
+    downstream eval take hours on the eager path (no fused Triton kernel on
+    Windows). Since an accuracy eval measures *accuracy, not footprint*, we
+    dequantize each layer ONCE into a plain ``nn.Linear``: the output is
+    bit-identical (same dequantized weight, same ``F.linear``) but runs at FP16
+    speed. Record the true quantized memory BEFORE calling this — densifying
+    materializes full FP16 weights and discards the compression.
+    """
+    repl = []
+    for parent in model.modules():
+        for attr, child in parent.named_children():
+            if isinstance(child, QuantizedLinear):
+                w = dequantize_tensor(child.quantized_weights, device=child.q_data.device)
+            elif isinstance(child, QuantizedLinear4bit):
+                deq = dequantize_tensor_nf4 if child.scheme == "nf4" else dequantize_tensor_fp4
+                w = deq(child.quantized_weights, device=child.q_packed.device)
+            else:
+                continue
+            lin = nn.Linear(child.in_features, child.out_features,
+                            bias=child.bias is not None)
+            lin.weight = nn.Parameter(w.to(torch.float16), requires_grad=False)
+            if child.bias is not None:
+                lin.bias = nn.Parameter(child.bias.to(torch.float16), requires_grad=False)
+            repl.append((parent, attr, lin.to(w.device)))
+    for parent, attr, lin in repl:
+        setattr(parent, attr, lin)
+    return model
 
 
 def primary_acc(task_result: dict) -> float:
@@ -97,6 +137,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--skip", nargs="*", default=[],
                     help="method keys to skip, e.g. --skip gptq mixed bnb")
+    ap.add_argument("--no-fast-eval", action="store_true",
+                    help="run the true eager quantized forward (slow) instead of "
+                         "baking dequantized weights into dense Linears; identical "
+                         "accuracy, ~15x slower. Auto-disabled under --device-map.")
     ap.add_argument("--out", default="results")
     args = ap.parse_args()
 
@@ -120,7 +164,12 @@ def main():
     def record(label, model, bits):
         on_cuda = next(model.parameters()).device.type == "cuda"
         model = model.eval() if on_cuda else model.to("cuda").eval()
+        # Footprint is measured on the *quantized* model; then (unless disabled)
+        # bake the dequantized weights into dense Linears so the accuracy eval
+        # runs at FP16 speed with bit-identical outputs.
         mb = model_weight_bytes(model) / 1024 ** 2
+        if not args.no_fast_eval and not args.device_map:
+            model = densify_for_eval(model)
         accs = evaluate(model, tok, args.tasks, args.limit, args.batch_size, args.device_map)
         avg = sum(accs.values()) / len(accs)
         cells = "  ".join(f"{t}={accs[t]:.3f}" for t in args.tasks)
