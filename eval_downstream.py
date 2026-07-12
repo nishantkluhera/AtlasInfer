@@ -32,6 +32,13 @@ import os
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import torch
+
+# Windows/CUDA stability: init the CUDA context before importing transformers
+# (see benchmark.py for the full note — avoids a 0xC0000005 access violation on
+# some Windows torch builds). No-op on CPU.
+if torch.cuda.is_available():
+    torch.zeros(1, device="cuda")
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.utils import logging as hf_logging
 
@@ -172,9 +179,9 @@ def main():
 
     # Table (stdout + file).
     fp16_avg = next(r["avg"] for r in rows if r["method"] == "fp16")
-    cols = "| Method | ~bits | MB | " + " | ".join(args.tasks) + " | avg | Δ avg vs FP16 |"
+    cols = "| Method | ~bits | MB | " + " | ".join(args.tasks) + " | avg | delta avg vs FP16 |"
     sep = "| --- | ---: | ---: | " + " | ".join("---:" for _ in args.tasks) + " | ---: | ---: |"
-    lines = [f"### {args.model} — downstream accuracy (seed {args.seed}, limit {args.limit})",
+    lines = [f"### {args.model} - downstream accuracy (seed {args.seed}, limit {args.limit})",
              "", cols, sep]
     for r in rows:
         task_cells = " | ".join(f"{r[t]:.3f}" for t in args.tasks)

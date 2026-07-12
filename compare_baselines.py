@@ -37,6 +37,13 @@ import os
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import torch
+
+# Windows/CUDA stability: init the CUDA context before importing transformers
+# (see benchmark.py for the full note — avoids a 0xC0000005 access violation on
+# some Windows torch builds). No-op on CPU.
+if torch.cuda.is_available():
+    torch.zeros(1, device="cuda")
+
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transformers.utils import logging as hf_logging
 

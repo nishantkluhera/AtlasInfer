@@ -32,6 +32,14 @@ import torch
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
+# Windows/CUDA stability: force clean CUDA-context init with a tiny warmup op
+# BEFORE importing transformers. On some Windows torch builds, importing
+# transformers (and its native deps) before any CUDA context exists races the
+# lazy context init and raises an access violation (0xC0000005) at the first
+# real GPU touch; a warmup here forces the correct init order. No-op on CPU.
+if torch.cuda.is_available():
+    torch.zeros(1, device="cuda")
+
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 from transformers.utils import logging as hf_logging  # noqa: E402
 
