@@ -255,7 +255,7 @@ class TestQuantizer:
         # Move to same device (should work even without GPU)
         moved = quantized.to(torch.device('cpu'))
         
-        assert moved.fp8_data.device == torch.device('cpu')
+        assert moved.int8_data.device == torch.device('cpu')
         assert moved.scales.device == torch.device('cpu')
         
         # Verify can still dequantize

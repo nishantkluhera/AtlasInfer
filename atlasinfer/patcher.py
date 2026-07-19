@@ -70,6 +70,7 @@ def quantize_model(
     verbose: bool = True,
     use_kernel: bool = False,
     quant_4bit: str = "nf4",
+    double_quant: bool = False,
 ) -> nn.Module:
     """Quantize every eligible linear layer to a single uniform precision."""
     return quantize_model_mixed(
@@ -80,6 +81,7 @@ def quantize_model(
         verbose=verbose,
         use_kernel=use_kernel,
         quant_4bit=quant_4bit,
+        double_quant=double_quant,
     )
 
 
@@ -91,6 +93,7 @@ def quantize_model_mixed(
     verbose: bool = True,
     use_kernel: bool = False,
     quant_4bit: str = "nf4",
+    double_quant: bool = False,
 ) -> nn.Module:
     """Replace linear layers in-place using a per-layer precision allocation.
 
@@ -121,7 +124,8 @@ def quantize_model_mixed(
         mdev = next(module.parameters()).device  # keep each layer on its own device
 
         new_layer = create_quantized_linear(
-            module, precision=precision, use_kernel=use_kernel, quant_4bit=quant_4bit
+            module, precision=precision, use_kernel=use_kernel, quant_4bit=quant_4bit,
+            double_quant=double_quant,
         ).to(mdev)
         quantized_size += _quantized_bytes(new_layer, orig_bytes)
 

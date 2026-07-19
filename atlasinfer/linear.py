@@ -16,6 +16,7 @@ from .quantizer import (
     QuantizedTensor, dequantize_tensor,
     QuantizedTensor4bit, dequantize_tensor_fp4,
 )
+from .double_quant import DoubleQuantScales
 
 
 class QuantizedLinear(nn.Module):
@@ -36,7 +37,7 @@ class QuantizedLinear(nn.Module):
 
         # Store packed components as buffers so .to(device) moves them and they
         # live persistently on the compute device (no per-forward host copy).
-        self.register_buffer("q_data", quantized_weights.fp8_data)
+        self.register_buffer("q_data", quantized_weights.int8_data)
         self.register_buffer("q_scales", quantized_weights.scales)
         self.register_buffer("q_outlier_indices", quantized_weights.outlier_indices)
         self.register_buffer("q_outlier_values", quantized_weights.outlier_values)
@@ -61,7 +62,7 @@ class QuantizedLinear(nn.Module):
     def quantized_weights(self) -> QuantizedTensor:
         """Reconstruct the QuantizedTensor view over the registered buffers."""
         return QuantizedTensor(
-            fp8_data=self.q_data,
+            int8_data=self.q_data,
             scales=self.q_scales,
             outlier_indices=self.q_outlier_indices,
             outlier_values=self.q_outlier_values,
@@ -123,6 +124,7 @@ class QuantizedLinear4bit(nn.Module):
         in_features: Optional[int] = None,
         out_features: Optional[int] = None,
         scheme: str = "int4",
+        in_scale: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         # scheme: "int4" (symmetric [-7,7]) or "nf4" (NormalFloat codebook).
@@ -137,10 +139,36 @@ class QuantizedLinear4bit(nn.Module):
         self._block_size = quantized_weights.block_size
         self._num_elements = quantized_weights.num_elements
 
+        # Double-quantized block scales (optional). Registered uniformly (empty
+        # buffers when unused) so the module structure / state_dict is consistent;
+        # the property below rebuilds the DoubleQuantScales only when populated.
+        dq = quantized_weights.scales_dq
+        dev = quantized_weights.packed_data.device
+        self.register_buffer(
+            "q_dq_codes", dq.codes if dq is not None
+            else torch.empty(0, dtype=torch.int8, device=dev))
+        self.register_buffer(
+            "q_dq_second", dq.second_scale if dq is not None
+            else torch.empty(0, dtype=torch.float32, device=dev))
+        self.register_buffer(
+            "q_dq_offset", dq.offset if dq is not None
+            else torch.empty(0, dtype=torch.float32, device=dev))
+        self._dq_group_size = dq.group_size if dq is not None else 0
+        self._dq_num_scales = dq.num_scales if dq is not None else 0
+
         if bias is not None:
             self.register_buffer("bias", bias)
         else:
             self.bias = None
+
+        # AWQ per-input-channel activation scale (optional). When present the
+        # stored weights are W·diag(in_scale) and the forward divides the input by
+        # in_scale, so W·diag(s) · (x/s) == W·x — the salient channels were
+        # amplified before quantization to survive the low-bit grid. See awq.py.
+        if in_scale is not None:
+            self.register_buffer("in_scale", in_scale)
+        else:
+            self.in_scale = None
 
         if in_features is None or out_features is None:
             shape = quantized_weights.original_shape
@@ -152,6 +180,13 @@ class QuantizedLinear4bit(nn.Module):
 
     @property
     def quantized_weights(self) -> QuantizedTensor4bit:
+        scales_dq = None
+        if self._dq_num_scales > 0:
+            scales_dq = DoubleQuantScales(
+                codes=self.q_dq_codes, second_scale=self.q_dq_second,
+                offset=self.q_dq_offset, group_size=self._dq_group_size,
+                num_scales=self._dq_num_scales,
+            )
         return QuantizedTensor4bit(
             packed_data=self.q_packed,
             scales=self.q_scales,
@@ -160,6 +195,7 @@ class QuantizedLinear4bit(nn.Module):
             original_shape=self._original_shape,
             block_size=self._block_size,
             num_elements=self._num_elements,
+            scales_dq=scales_dq,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -170,7 +206,10 @@ class QuantizedLinear4bit(nn.Module):
         else:
             weight = dequantize_tensor_fp4(self.quantized_weights, device=x.device)
         bias = self.bias.to(weight.dtype) if self.bias is not None else None
-        out = F.linear(x.to(weight.dtype), weight, bias)
+        xw = x.to(weight.dtype)
+        if self.in_scale is not None:  # AWQ: undo the per-channel weight scaling
+            xw = xw / self.in_scale.to(weight.dtype)
+        out = F.linear(xw, weight, bias)
         return out.to(in_dtype)
 
     def extra_repr(self) -> str:
@@ -186,16 +225,20 @@ class QuantizedLinear4bit(nn.Module):
         block_size: int = 64,
         outlier_threshold: float = 2.5,
         scheme: str = "int4",
+        double_quant: bool = False,
     ) -> "QuantizedLinear4bit":
         from .quantizer import quantize_tensor_fp4, quantize_tensor_nf4
 
         weight_cpu = linear.weight.data.cpu()
-        quantizer = quantize_tensor_nf4 if scheme == "nf4" else quantize_tensor_fp4
-        quantized_weights = quantizer(
-            weight_cpu,
-            block_size=block_size,
-            outlier_threshold=outlier_threshold,
-        )
+        if scheme == "nf4":
+            quantized_weights = quantize_tensor_nf4(
+                weight_cpu, block_size=block_size,
+                outlier_threshold=outlier_threshold, double_quant=double_quant,
+            )
+        else:  # symmetric int4 has no double-quant path
+            quantized_weights = quantize_tensor_fp4(
+                weight_cpu, block_size=block_size, outlier_threshold=outlier_threshold,
+            )
         bias = linear.bias.data.clone() if linear.bias is not None else None
 
         return cls(
@@ -229,6 +272,7 @@ def create_quantized_linear(
     outlier_threshold_int4: float = 2.5,
     use_kernel: bool = False,
     quant_4bit: str = "nf4",
+    double_quant: bool = False,
 ) -> Union[QuantizedLinear, QuantizedLinear4bit, nn.Linear]:
     """Create the appropriate quantized layer for the requested precision.
 
@@ -273,6 +317,7 @@ def create_quantized_linear(
             block_size=block_size_int4,
             outlier_threshold=outlier_threshold_int4,
             scheme=quant_4bit,
+            double_quant=double_quant,
         )
     else:
         raise ValueError(

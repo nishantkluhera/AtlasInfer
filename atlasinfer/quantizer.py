@@ -15,13 +15,16 @@ tensor - rather than as a dense boolean mask. Because typical outlier rates are
 well under 1%, this keeps the overhead negligible; a dense mask would cost a full
 byte per weight and erase the memory savings entirely.
 
-Note on naming: the 8-bit path is symmetric INT8 (not IEEE FP8 E4M3). The field
-``fp8_data`` is an int8 buffer; the name is retained only for API stability.
+Note on naming: the 8-bit path is symmetric INT8 (not IEEE FP8 E4M3) and the
+4-bit path is integer/NF4 (not IEEE FP4). Fields and buffers are named ``int8_*``
+accordingly.
 """
 import math
 from typing import NamedTuple, Optional
 
 import torch
+
+from .double_quant import DoubleQuantScales, double_quantize
 
 # Symmetric integer ranges. INT8 fits [-127, 127]; INT4 uses a symmetric [-7, 7].
 INT8_MAX = 127.0
@@ -34,10 +37,6 @@ INT4_MAX = 7.0
 # FP16 would invert the compression, so we flag nothing there and quantize the
 # block normally. See ``_find_outliers``.
 _MAX_OUTLIER_FRACTION = 0.25
-
-# Legacy aliases.
-FP8_MAX, FP8_MIN = INT8_MAX, -INT8_MAX
-FP4_MAX, FP4_MIN = INT4_MAX, -INT4_MAX
 
 # NF4 (NormalFloat-4, from QLoRA): 16 levels placed at the quantiles of a unit
 # normal distribution, normalized to [-1, 1] with an exact 0. Because LLM weights
@@ -55,14 +54,14 @@ NF4_LEVELS = torch.tensor([
 class QuantizedTensor(NamedTuple):
     """A tensor quantized to symmetric INT8 with sparse FP16 outliers.
 
-    - fp8_data:        INT8 storage (symmetric 8-bit; name kept for API stability)
+    - int8_data:       INT8 storage (symmetric 8-bit)
     - scales:          per-block scale factors (FP32)
     - outlier_indices: INT32 positions of outliers into the flattened tensor
     - outlier_values:  FP16 values at those positions
     - original_shape:  shape for reconstruction
     - block_size:      block size used for per-block scaling
     """
-    fp8_data: torch.Tensor
+    int8_data: torch.Tensor
     scales: torch.Tensor
     outlier_indices: torch.Tensor
     outlier_values: torch.Tensor
@@ -71,7 +70,7 @@ class QuantizedTensor(NamedTuple):
 
     def to(self, device: torch.device) -> "QuantizedTensor":
         return QuantizedTensor(
-            fp8_data=self.fp8_data.to(device),
+            int8_data=self.int8_data.to(device),
             scales=self.scales.to(device),
             outlier_indices=self.outlier_indices.to(device),
             outlier_values=self.outlier_values.to(device),
@@ -81,7 +80,7 @@ class QuantizedTensor(NamedTuple):
 
     def memory_bytes(self) -> int:
         return (
-            self.fp8_data.numel() * self.fp8_data.element_size()
+            self.int8_data.numel() * self.int8_data.element_size()
             + self.scales.numel() * self.scales.element_size()
             + self.outlier_indices.numel() * self.outlier_indices.element_size()
             + self.outlier_values.numel() * self.outlier_values.element_size()
@@ -208,7 +207,7 @@ def quantize_tensor(
         tensor, block_size, INT8_MAX, outlier_threshold
     )
     return QuantizedTensor(
-        fp8_data=q_flat.view(shape).to(dev),
+        int8_data=q_flat.view(shape).to(dev),
         scales=scales.to(dev),
         outlier_indices=oidx.to(dev),
         outlier_values=oval.to(dev),
@@ -220,16 +219,16 @@ def quantize_tensor(
 def dequantize_tensor(qt: QuantizedTensor, device: Optional[torch.device] = None) -> torch.Tensor:
     """Reconstruct an FP16 tensor from a :class:`QuantizedTensor`."""
     if device is None:
-        device = qt.fp8_data.device
-    if qt.fp8_data.numel() == 0:
+        device = qt.int8_data.device
+    if qt.int8_data.numel() == 0:
         return torch.empty(qt.original_shape, dtype=torch.float16, device=device)
 
-    fp8 = qt.fp8_data.to(device)
+    q8 = qt.int8_data.to(device)
     scales = qt.scales.to(device)
     block_size = qt.block_size
-    num_elements = fp8.numel()
+    num_elements = q8.numel()
 
-    flat = fp8.flatten().float()
+    flat = q8.flatten().float()
     padded = math.ceil(num_elements / block_size) * block_size
     if padded > num_elements:
         flat = torch.nn.functional.pad(flat, (0, padded - num_elements))
@@ -257,12 +256,16 @@ class QuantizedTensor4bit(NamedTuple):
     Two 4-bit values share each int8 byte.
     """
     packed_data: torch.Tensor      # int8, two 4-bit values per byte
-    scales: torch.Tensor           # per-block scales (FP32)
+    scales: torch.Tensor           # per-block scales (FP32); empty when scales_dq set
     outlier_indices: torch.Tensor  # INT32 positions into the flattened tensor
     outlier_values: torch.Tensor   # FP16 values at those positions
     original_shape: torch.Size
     block_size: int
     num_elements: int
+    # Optional double-quantized block scales (QLoRA-style). When present the FP32
+    # ``scales`` above is empty and the compressed form is what stays resident; the
+    # dequant path reconstructs the FP32 scales transiently. See double_quant.py.
+    scales_dq: Optional[DoubleQuantScales] = None
 
     def to(self, device: torch.device) -> "QuantizedTensor4bit":
         return QuantizedTensor4bit(
@@ -273,12 +276,24 @@ class QuantizedTensor4bit(NamedTuple):
             original_shape=self.original_shape,
             block_size=self.block_size,
             num_elements=self.num_elements,
+            scales_dq=self.scales_dq.to(device) if self.scales_dq is not None else None,
         )
 
+    def block_scales(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        """The per-block FP32 scales, reconstructed from the double-quantized form
+        if that's how they're stored, else returned directly."""
+        if self.scales_dq is not None:
+            return self.scales_dq.reconstruct(device)
+        return self.scales.to(device) if device is not None else self.scales
+
     def memory_bytes(self) -> int:
+        scale_bytes = (
+            self.scales_dq.memory_bytes() if self.scales_dq is not None
+            else self.scales.numel() * self.scales.element_size()
+        )
         return (
             self.packed_data.numel() * self.packed_data.element_size()
-            + self.scales.numel() * self.scales.element_size()
+            + scale_bytes
             + self.outlier_indices.numel() * self.outlier_indices.element_size()
             + self.outlier_values.numel() * self.outlier_values.element_size()
         )
@@ -354,7 +369,8 @@ def dequantize_tensor_fp4(qt: QuantizedTensor4bit, device: Optional[torch.device
 # NF4 (NormalFloat-4) - a distribution-matched 4-bit codebook
 # ============================================================================ #
 def quantize_tensor_nf4(
-    tensor: torch.Tensor, block_size: int = 64, outlier_threshold: float = 2.5
+    tensor: torch.Tensor, block_size: int = 64, outlier_threshold: float = 2.5,
+    double_quant: bool = False,
 ) -> QuantizedTensor4bit:
     """Quantize to packed NF4 codes with per-block absmax scale and sparse outliers.
 
@@ -362,6 +378,10 @@ def quantize_tensor_nf4(
     the nearest NF4 level; the 4-bit *code* (0..15) is what gets packed. Reuses
     :class:`QuantizedTensor4bit` for storage - decode with
     :func:`dequantize_tensor_nf4` (the codes index the NF4 codebook, not [-7,7]).
+
+    ``double_quant``: additionally compress the per-block FP32 scales to INT8 +
+    per-group (scale, offset) (QLoRA-style), cutting the ~0.5 bit/weight scale
+    overhead ~4x — the memory trick bitsandbytes uses at 4-bit. See double_quant.py.
     """
     num_elements = tensor.numel()
     dev = tensor.device
@@ -399,14 +419,21 @@ def quantize_tensor_nf4(
         codes = torch.nn.functional.pad(codes, (0, pack_size - num_elements))
     packed = ((codes[0::2] << 4) | (codes[1::2] & 0x0F)).to(torch.int8)
 
+    block_scales = absmax.squeeze(1).to(dev)
+    scales_dq = None
+    if double_quant:
+        scales_dq = double_quantize(block_scales).to(dev)
+        block_scales = torch.empty(0, dtype=torch.float32, device=dev)  # not resident
+
     return QuantizedTensor4bit(
         packed_data=packed.to(dev),
-        scales=absmax.squeeze(1).to(dev),
+        scales=block_scales,
         outlier_indices=oidx.to(dev),
         outlier_values=oval.to(dev),
         original_shape=tensor.shape,
         block_size=block_size,
         num_elements=num_elements,
+        scales_dq=scales_dq,
     )
 
 
@@ -418,7 +445,7 @@ def dequantize_tensor_nf4(qt: QuantizedTensor4bit, device: Optional[torch.device
         return torch.empty(qt.original_shape, dtype=torch.float16, device=device)
 
     packed = qt.packed_data.to(device).to(torch.uint8)
-    scales = qt.scales.to(device)
+    scales = qt.block_scales(device)  # reconstructs from double-quant if used
 
     high = (packed >> 4) & 0x0F
     low = packed & 0x0F

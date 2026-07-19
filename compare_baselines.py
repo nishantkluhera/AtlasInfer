@@ -51,6 +51,7 @@ from atlasinfer.patcher import quantize_model, quantize_model_mixed
 from atlasinfer.sensitivity import SensitivityProfiler
 from atlasinfer.allocator import allocate_optimal
 from atlasinfer.gptq import quantize_model_gptq
+from atlasinfer.awq import quantize_model_awq
 from benchmark import evaluate_perplexity, load_wikitext
 
 hf_logging.set_verbosity_error()
@@ -87,10 +88,16 @@ def awq_baseline(model_name, tokenizer):
     method.
     """
     from awq import AutoAWQForCausalLM
-    m = AutoAWQForCausalLM.from_pretrained(model_name, dtype=torch.float16)
+    # autoawq's kwarg is torch_dtype (not dtype); load straight onto the GPU so
+    # calibration and the returned model share one device (else eval hits a
+    # cuda/cpu mismatch). NOTE: autoawq 0.2.9 is deprecated and last tested on
+    # transformers 4.51 — it may fail to import/quantize on newer transformers,
+    # in which case the caller skips it.
+    m = AutoAWQForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.float16, device_map="cuda:0")
     m.quantize(tokenizer, quant_config={
         "w_bit": 4, "q_group_size": 128, "zero_point": True, "version": "GEMM"})
-    return m.model
+    return m.model.to("cuda")
 
 
 def main():
@@ -102,6 +109,10 @@ def main():
                     help="shard across all GPUs (device_map=auto) for models too big "
                          "for one card, e.g. 7-13B on Kaggle T4x2")
     ap.add_argument("--seed", type=int, default=0, help="RNG seed (reproducibility)")
+    ap.add_argument("--double-quant", action="store_true",
+                    help="also measure AtlasInfer nf4 / gptq-nf4 with double-quantized "
+                         "scales (QLoRA-style), which closes most of the 4-bit memory "
+                         "gap to bnb's NF4 at ~unchanged perplexity")
     ap.add_argument("--skip", nargs="*", default=[],
                     help="method keys to skip, e.g. --skip awq gptq (for slow/absent baselines)")
     args = ap.parse_args()
@@ -153,11 +164,26 @@ def main():
            quantize_model(fp16(), precision="int4", quant_4bit="int4", verbose=False), 4)
     record("AtlasInfer nf4",
            quantize_model(fp16(), precision="int4", quant_4bit="nf4", verbose=False), 4)
+    if args.double_quant:
+        record("AtlasInfer nf4+dq",
+               quantize_model(fp16(), precision="int4", quant_4bit="nf4",
+                              double_quant=True, verbose=False), 4)
 
     # NF4 + GPTQ error compensation (needs the model on-device for the Hessian pass).
     gm = place(fp16()).eval()
     quantize_model_gptq(gm, tokenizer=tok, calibration_texts=calib, verbose=False)
     record("AtlasInfer gptq-nf4", gm, 4)
+    if args.double_quant:
+        gmd = place(fp16()).eval()
+        quantize_model_gptq(gmd, tokenizer=tok, calibration_texts=calib,
+                            double_quant=True, verbose=False)
+        record("AtlasInfer gptq-nf4+dq", gmd, 4)
+
+    # AWQ: activation-aware scaling — a Hessian-free route to the same 4-bit tier.
+    if "awq-nf4" not in args.skip:
+        am = place(fp16()).eval()
+        quantize_model_awq(am, tokenizer=tok, calibration_texts=calib, verbose=False)
+        record("AtlasInfer awq-nf4", am, 4)
 
     # AtlasInfer mixed (profile once, allocate at target bits).
     base = place(fp16()).eval()

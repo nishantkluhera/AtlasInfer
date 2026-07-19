@@ -36,6 +36,11 @@ from .triton_kernels import (
     quantize_w8a16, quantize_w4a16,
 )
 from .gptq import gptq_quantize_nf4, quantize_model_gptq
+from .double_quant import DoubleQuantScales, double_quantize, dq_relative_error
+from .awq import quantize_model_awq, search_awq_scale
+from .codebook import (
+    VectorQuantizedTensor, quantize_tensor_vq, dequantize_tensor_vq,
+)
 from .reproducibility import seed_everything
 from .inference import AtlasInference
 
@@ -62,6 +67,12 @@ __all__ = [
     "quantize_w8a16", "quantize_w4a16",
     # GPTQ
     "gptq_quantize_nf4", "quantize_model_gptq",
+    # Double-quantized scales
+    "DoubleQuantScales", "double_quantize", "dq_relative_error",
+    # AWQ
+    "quantize_model_awq", "search_awq_scale",
+    # Experimental sub-4-bit vector-quantized codebook (not validated at scale)
+    "VectorQuantizedTensor", "quantize_tensor_vq", "dequantize_tensor_vq",
     # Reproducibility
     "seed_everything",
     # Inference

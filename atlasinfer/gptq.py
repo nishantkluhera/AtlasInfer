@@ -23,6 +23,7 @@ from .quantizer import NF4_LEVELS, QuantizedTensor4bit, quantize_tensor_nf4, _fi
 from .linear import QuantizedLinear4bit, _conv1d_to_linear
 from .patcher import _collect_targets, DEFAULT_EXCLUDE
 from .sensitivity import SensitivityProfiler
+from .double_quant import double_quantize
 
 
 def _in_features(module: nn.Module) -> int:
@@ -39,7 +40,8 @@ def _nf4_codes(norm: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def gptq_quantize_nf4(W: torch.Tensor, H: torch.Tensor, group_size: int = 64,
-                      percdamp: float = 0.01, outlier_threshold: float = 2.5) -> QuantizedTensor4bit:
+                      percdamp: float = 0.01, outlier_threshold: float = 2.5,
+                      double_quant: bool = False) -> QuantizedTensor4bit:
     """GPTQ-compensated NF4 quantization with sparse-outlier preservation.
 
     Combines three things: (1) per-(output-channel, input-group) NF4 scales
@@ -143,14 +145,21 @@ def gptq_quantize_nf4(W: torch.Tensor, H: torch.Tensor, group_size: int = 64,
         oidx = torch.empty(0, dtype=torch.int32, device=dev)
         oval = torch.empty(0, dtype=torch.float16, device=dev)
 
+    block_scales = scales.reshape(-1).to(torch.float32).to(dev)
+    scales_dq = None
+    if double_quant:
+        scales_dq = double_quantize(block_scales).to(dev)
+        block_scales = torch.empty(0, dtype=torch.float32, device=dev)  # not resident
+
     return QuantizedTensor4bit(
         packed_data=packed.to(dev),
-        scales=scales.reshape(-1).to(torch.float32).to(dev),
+        scales=block_scales,
         outlier_indices=oidx.to(dev),
         outlier_values=oval.to(dev),
         original_shape=torch.Size([out, cols]),
         block_size=group_size,
         num_elements=out * cols,
+        scales_dq=scales_dq,
     )
 
 
@@ -190,6 +199,7 @@ def quantize_model_gptq(
     seqlen: int = 512,
     hessian_budget_gb: float = 4.0,
     exclude_patterns=None,
+    double_quant: bool = False,
     verbose: bool = True,
 ) -> nn.Module:
     """Quantize all eligible linear layers to NF4 with GPTQ error compensation.
@@ -242,12 +252,14 @@ def quantize_model_gptq(
             qt = None
             if W.shape[1] % group_size == 0 and name in Hs:
                 try:
-                    qt = gptq_quantize_nf4(W, Hs[name].to(ldev), group_size=group_size)
+                    qt = gptq_quantize_nf4(W, Hs[name].to(ldev), group_size=group_size,
+                                           double_quant=double_quant)
                     n_gptq += 1
                 except torch.linalg.LinAlgError:
                     qt = None
             if qt is None:  # unaligned in_features or unfactorable Hessian -> plain NF4
-                qt = quantize_tensor_nf4(W.cpu(), block_size=group_size)
+                qt = quantize_tensor_nf4(W.cpu(), block_size=group_size,
+                                         double_quant=double_quant)
                 n_fallback += 1
             setattr(parent, attr, QuantizedLinear4bit(
                 qt.to(ldev), bias=bias,
