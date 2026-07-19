@@ -19,7 +19,15 @@ import subprocess
 import sys
 import time
 
-DEFAULT_MODELS = ["gpt2", "Qwen/Qwen2.5-0.5B", "Qwen/Qwen3-0.6B-Base"]
+# Diverse, DENSE, ungated small (<=6 GB laptop) open models spanning FAMILIES --
+# cross-family results (different weight/outlier structure) are what make a quant
+# result credible, vs testing one vendor. Override with --models. Latest-tiny
+# alternative: Qwen/Qwen3.5-0.8B-Base (newest Qwen, but hybrid Gated-Delta/MoE arch).
+DEFAULT_MODELS = [
+    "HuggingFaceTB/SmolLM2-1.7B",   # HuggingFace (Apache, fully open)
+    "Qwen/Qwen3-0.6B-Base",         # Alibaba Qwen (dense)
+    "EleutherAI/pythia-1.4b",       # EleutherAI (dense; same-data suite)
+]
 STAGES = {
     "benchmark":  [sys.executable, "benchmark.py"],
     "baselines":  [sys.executable, "compare_baselines.py"],

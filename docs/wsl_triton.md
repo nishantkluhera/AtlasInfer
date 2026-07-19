@@ -38,10 +38,18 @@ extracting the `.deb` and pointing gcc at them:
 
 ```bash
 cd ~ && mkdir -p pydev && cd pydev
-apt-get download libpython3.12-dev python3.12-dev      # no root needed
+
+# If `apt-get download` below says "no candidate version", the apt index is stale
+# and refreshing it normally needs root. Refresh a *user-local* index instead:
+mkdir -p ~/aptroot/lists/partial ~/aptroot/cache/archives/partial
+APT="-o Dir::State::Lists=$HOME/aptroot/lists -o Dir::Cache=$HOME/aptroot/cache -o Acquire::Languages=none"
+apt-get $APT update                                    # no root needed
+
+apt-get $APT download libpython3.12-dev python3.12-dev # (drop $APT if the system index is fresh)
 for d in *.deb; do dpkg-deb -x "$d" extracted; done
-export C_INCLUDE_PATH="$PWD/extracted/usr/include/python3.12:$PWD/extracted/usr/include"
+export C_INCLUDE_PATH="$PWD/extracted/usr/include/python3.12:$PWD/extracted/usr/include/x86_64-linux-gnu/python3.12:$PWD/extracted/usr/include"
 # now run bench_triton_kernel.py in this shell
 ```
 
-(Match `python3.12` to your distro's Python version.)
+(Match `python3.12` to your distro's Python version. The multiarch include path
+carries `pyconfig.h`, which `Python.h` needs.)
