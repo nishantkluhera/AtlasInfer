@@ -70,6 +70,40 @@ class TestLayerIdentity:
         assert rel < 0.15, f"AWQ layer identity broken: {rel:.3f}"
 
 
+class TestDensifyPreservesAWQ:
+    def test_densified_awq_layer_matches_the_quantized_layer(self):
+        """Regression: baking an AWQ layer into a dense nn.Linear must fold the
+        in_scale into the weight.
+
+        The layer stores W·diag(s) and divides the input by s at run time. A plain
+        Linear has nowhere to put that division, so it has to become
+        (W·diag(s))·diag(1/s). Dropping it scales every input channel by s_j and
+        silently produces garbage — with no exception to notice.
+        """
+        from eval_downstream import densify_for_eval
+
+        torch.manual_seed(0)
+        lin = nn.Linear(64, 32, bias=True)
+        s = torch.rand(64) + 0.5
+        qt = quantize_tensor_nf4(lin.weight.data * s)
+        awq_layer = QuantizedLinear4bit(
+            qt, bias=lin.bias.data.clone(), in_features=64, out_features=32,
+            scheme="nf4", in_scale=s.float(),
+        )
+        # densify_for_eval bakes weights as FP16 (it exists to run the eval at
+        # FP16 speed), so drive both with an FP16 input.
+        x = torch.randn(8, 64, dtype=torch.float16)
+        before = awq_layer(x)
+
+        holder = nn.Sequential(awq_layer)
+        densify_for_eval(holder)
+        assert isinstance(holder[0], nn.Linear)
+        after = holder[0](x)
+
+        rel = (before.float() - after.float()).norm() / before.float().norm()
+        assert rel < 0.02, f"densify changed AWQ layer output by {rel:.3f}"
+
+
 class _Tiny(nn.Module):
     """Minimal LM-shaped model (embedding -> 2 linears) for the AWQ model pass."""
     def __init__(self, d=64, vocab=128):

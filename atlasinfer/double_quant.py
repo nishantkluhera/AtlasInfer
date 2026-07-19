@@ -91,9 +91,22 @@ def double_quantize(scales: torch.Tensor, group_size: int = DEFAULT_DQ_GROUP) ->
         scales = torch.nn.functional.pad(scales, (0, padded - num_scales))
     groups = scales.view(n_groups, group_size)
 
-    offset = groups.mean(dim=1, keepdim=True)                       # per-group mean
-    centered = groups - offset
+    # The tail group is zero-padded up to group_size. Those zeros are an artifact,
+    # not data: left in, they drag the group's mean toward 0 and then show up as
+    # |0 - offset| in the absmax, inflating second_scale and coarsening the INT8
+    # codes for the *real* scales (worst when num_scales < group_size, where most
+    # of the only group is padding). So compute both statistics over valid
+    # positions only -- the same reason _find_outliers takes ``num_valid``.
+    valid = torch.zeros(padded, dtype=torch.bool, device=scales.device)
+    valid[:num_scales] = True
+    valid = valid.view(n_groups, group_size)
+    n_valid = valid.sum(dim=1, keepdim=True).clamp(min=1)
+
+    offset = (groups * valid).sum(dim=1, keepdim=True) / n_valid    # per-group mean
+    centered = (groups - offset).masked_fill(~valid, 0.0)
     second_scale = centered.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / _DQ_INT8_MAX
+    # Codes at padding positions are meaningless but harmless: reconstruct() slices
+    # back to num_scales, so they are never read.
     codes = torch.clamp((centered / second_scale).round(), -127, 127).to(torch.int8)
 
     return DoubleQuantScales(

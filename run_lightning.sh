@@ -119,6 +119,10 @@ latency()    { "$PY" bench_latency.py --model "$MODEL"; }
 _stage() {                      # _stage <label> <fn> [model]
   local label="$1" fn="$2" mdl="${3:-$MODEL}" start=$SECONDS
   mkdir -p results/_logs
+  # Truncate, don't append: on a retry a stale log would otherwise still be here,
+  # and the abort path below tails setup.log -- showing a PREVIOUS run's error as
+  # if it were the current one.
+  : > "results/_logs/${label}.log"
   echo "[$(date '+%F %T')] START $label  ($mdl)"
   if MODEL="$mdl" "$fn" >> "results/_logs/${label}.log" 2>&1; then
     printf 'OK    %-34s %4d min\n' "$label" $(( (SECONDS-start)/60 )) >> "$SUMMARY"

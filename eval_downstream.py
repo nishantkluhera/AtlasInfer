@@ -81,6 +81,13 @@ def densify_for_eval(model: nn.Module) -> nn.Module:
             elif isinstance(child, QuantizedLinear4bit):
                 deq = dequantize_tensor_nf4 if child.scheme == "nf4" else dequantize_tensor_fp4
                 w = deq(child.quantized_weights, device=child.q_packed.device)
+                # An AWQ layer stores W·diag(s) and divides the input by s at run
+                # time. A plain nn.Linear has nowhere to put that division, so fold
+                # it into the weight instead: (W·diag(s))·diag(1/s) == W. Dropping
+                # it would scale every input channel by s_j (s spans 1e-2..1e2) and
+                # silently produce garbage accuracy with no error raised.
+                if getattr(child, "in_scale", None) is not None:
+                    w = (w.float() / child.in_scale.to(w.device).float()).to(w.dtype)
             else:
                 continue
             lin = nn.Linear(child.in_features, child.out_features,

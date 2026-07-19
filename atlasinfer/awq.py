@@ -82,8 +82,13 @@ def _capture_awq_stats(model, targets, calib_batches, max_rows: int = 128):
 def search_awq_scale(
     W: torch.Tensor, act_absmean: torch.Tensor, x_rows: torch.Tensor,
     alphas: Sequence[float] = DEFAULT_ALPHAS,
+    block_size: int = 64, outlier_threshold: float = 2.5,
 ) -> torch.Tensor:
     """Grid-search the per-input-channel AWQ scale that minimizes NF4 output MSE.
+
+    ``block_size``/``outlier_threshold`` must match what the layer will actually
+    be quantized with, or the search optimizes alpha against a different grid
+    than the one deployed and can pick a worse scale.
 
     Args:
         W: (out_features, in_features) float weight, on the compute device.
@@ -105,7 +110,12 @@ def search_awq_scale(
         s = salience.pow(alpha)
         s = (s / s.mean().clamp(min=1e-8)).clamp(min=1e-2, max=1e2)
         Ws = (W * s.unsqueeze(0))                         # amplify salient columns
-        qWs = dequantize_tensor_nf4(quantize_tensor_nf4(Ws.cpu())).to(dev).to(W.dtype)
+        # Quantize on-device with the SAME config the layer will be deployed with.
+        # (A .cpu() round-trip here would move the full weight matrix off and back
+        # once per alpha per layer -- thousands of transfers over a whole model.)
+        qWs = dequantize_tensor_nf4(quantize_tensor_nf4(
+            Ws, block_size=block_size, outlier_threshold=outlier_threshold,
+        )).to(dev).to(W.dtype)
         out = (x / s) @ qWs.t()
         err = (out - ref).pow(2).mean() / ref_norm
         if best_err is None or err < best_err:
@@ -154,17 +164,20 @@ def quantize_model_awq(
 
         if name in stats and W.shape[1] % block_size == 0:
             act_absmean, x_rows = stats[name]
-            s = search_awq_scale(W.to(ldev), act_absmean, x_rows, alphas)
+            s = search_awq_scale(W.to(ldev), act_absmean, x_rows, alphas,
+                                 block_size=block_size)
             Ws = (W.to(ldev) * s.unsqueeze(0))
-            qt = quantize_tensor_nf4(Ws.cpu(), block_size=block_size, double_quant=double_quant)
+            qt = quantize_tensor_nf4(Ws, block_size=block_size, double_quant=double_quant)
             layer = QuantizedLinear4bit(
                 qt.to(ldev), bias=bias, in_features=linear.in_features,
                 out_features=linear.out_features, scheme="nf4",
-                in_scale=s.to(ldev).to(torch.float16),
+                # Keep FP32: the forward divides by exactly this value, and it is
+                # the same s folded into Ws above, so the scaling cancels exactly.
+                in_scale=s.to(ldev).float(),
             )
             n_awq += 1
         else:  # no stats (layer never fired) or unaligned in_features -> plain NF4
-            qt = quantize_tensor_nf4(W.cpu(), block_size=block_size, double_quant=double_quant)
+            qt = quantize_tensor_nf4(W, block_size=block_size, double_quant=double_quant)
             layer = QuantizedLinear4bit(
                 qt.to(ldev), bias=bias, in_features=linear.in_features,
                 out_features=linear.out_features, scheme="nf4",

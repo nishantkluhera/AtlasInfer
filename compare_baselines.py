@@ -114,7 +114,10 @@ def main():
                          "scales (QLoRA-style), which closes most of the 4-bit memory "
                          "gap to bnb's NF4 at ~unchanged perplexity")
     ap.add_argument("--skip", nargs="*", default=[],
-                    help="method keys to skip, e.g. --skip awq gptq (for slow/absent baselines)")
+                    help="method keys to skip, e.g. --skip awq gptq. Keys: gptq, awq "
+                         "(external baselines), gptq-nf4, awq-nf4, nf4-dq, gptq-nf4-dq "
+                         "(AtlasInfer). A prefix skips its variants, so `--skip awq` "
+                         "drops both the external AWQ and AtlasInfer's awq-nf4.")
     args = ap.parse_args()
 
     from atlasinfer import seed_everything
@@ -153,6 +156,23 @@ def main():
     def place(model):  # put on GPU for in-place work (no-op if already device-mapped)
         return model if args.device_map else model.to(dev)
 
+    def guarded(key, label, fn, bits=4):
+        """Measure one method, but never let its failure discard the whole run.
+
+        The results table is only written at the very end, so an unguarded
+        exception here (an OOM quantizing a 7B+ model is the common one) throws
+        away every row already measured -- potentially hours of a cloud run. Skip
+        keys are matched loosely so `--skip awq` also skips `awq-nf4`.
+        """
+        if any(k == key or key.startswith(k + "-") for k in args.skip):
+            print(f"  {label:<22} SKIPPED (--skip)")
+            return
+        try:
+            record(label, fn(), bits)
+        except Exception as exc:  # noqa: BLE001 - one method must not sink the run
+            print(f"  {label:<22} FAILED ({type(exc).__name__}: {exc}) -- continuing")
+            gc.collect(); torch.cuda.empty_cache()
+
     print(f"\nComparing on {args.model} (WikiText-2, {args.eval_tokens} eval tokens)\n")
 
     # FP16 baseline.
@@ -165,25 +185,26 @@ def main():
     record("AtlasInfer nf4",
            quantize_model(fp16(), precision="int4", quant_4bit="nf4", verbose=False), 4)
     if args.double_quant:
-        record("AtlasInfer nf4+dq",
-               quantize_model(fp16(), precision="int4", quant_4bit="nf4",
-                              double_quant=True, verbose=False), 4)
+        guarded("nf4-dq", "AtlasInfer nf4+dq",
+                lambda: quantize_model(fp16(), precision="int4", quant_4bit="nf4",
+                                       double_quant=True, verbose=False))
 
     # NF4 + GPTQ error compensation (needs the model on-device for the Hessian pass).
-    gm = place(fp16()).eval()
-    quantize_model_gptq(gm, tokenizer=tok, calibration_texts=calib, verbose=False)
-    record("AtlasInfer gptq-nf4", gm, 4)
+    def _gptq(double_quant=False):
+        gm = place(fp16()).eval()
+        quantize_model_gptq(gm, tokenizer=tok, calibration_texts=calib,
+                            double_quant=double_quant, verbose=False)
+        return gm
+    guarded("gptq-nf4", "AtlasInfer gptq-nf4", _gptq)
     if args.double_quant:
-        gmd = place(fp16()).eval()
-        quantize_model_gptq(gmd, tokenizer=tok, calibration_texts=calib,
-                            double_quant=True, verbose=False)
-        record("AtlasInfer gptq-nf4+dq", gmd, 4)
+        guarded("gptq-nf4-dq", "AtlasInfer gptq-nf4+dq", lambda: _gptq(double_quant=True))
 
     # AWQ: activation-aware scaling — a Hessian-free route to the same 4-bit tier.
-    if "awq-nf4" not in args.skip:
+    def _awq():
         am = place(fp16()).eval()
         quantize_model_awq(am, tokenizer=tok, calibration_texts=calib, verbose=False)
-        record("AtlasInfer awq-nf4", am, 4)
+        return am
+    guarded("awq-nf4", "AtlasInfer awq-nf4", _awq)
 
     # AtlasInfer mixed (profile once, allocate at target bits).
     base = place(fp16()).eval()

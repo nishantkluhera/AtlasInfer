@@ -62,6 +62,13 @@ def model_weight_bytes(model: torch.nn.Module) -> int:
             total += module.quantized_weights.memory_bytes()
             if module.bias is not None:
                 total += module.bias.numel() * module.bias.element_size()
+            # AWQ's per-input-channel scale is a buffer, so it is in neither
+            # model.parameters() nor quantized_weights.memory_bytes(). Without
+            # this an AWQ model under-reports, and disagrees with
+            # compare_baselines.resident_bytes() (params + ALL buffers).
+            in_scale = getattr(module, "in_scale", None)
+            if in_scale is not None:
+                total += in_scale.numel() * in_scale.element_size()
     return total
 
 

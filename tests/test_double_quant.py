@@ -33,6 +33,22 @@ class TestDoubleQuantScales:
         assert recon.shape == scales.shape
         assert dq.num_scales == 300
 
+    def test_tail_group_padding_does_not_wreck_precision(self):
+        """Regression: the zero-padding of a partial final group must not enter
+        the group's mean/absmax.
+
+        With num_scales < group_size almost the whole (only) group is padding;
+        counting those zeros drags the offset toward 0 and then reappears as
+        |0 - offset| in the absmax, inflating second_scale and coarsening the
+        codes for the real scales. Reconstruction must stay tight regardless of
+        how the count lands relative to the group size.
+        """
+        torch.manual_seed(0)
+        for n in (100, 300, 512, 700):          # 100 -> mostly padding
+            scales = torch.rand(n).abs() * 0.05 + 1e-3
+            err = dq_relative_error(scales)
+            assert err < 0.01, f"n={n} tail padding degraded precision: {err:.4f}"
+
     def test_memory_is_about_a_quarter(self):
         scales = torch.rand(2560)  # 10 groups of 256
         dq = double_quantize(scales)

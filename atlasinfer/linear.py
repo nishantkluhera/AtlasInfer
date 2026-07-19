@@ -206,9 +206,14 @@ class QuantizedLinear4bit(nn.Module):
         else:
             weight = dequantize_tensor_fp4(self.quantized_weights, device=x.device)
         bias = self.bias.to(weight.dtype) if self.bias is not None else None
-        xw = x.to(weight.dtype)
-        if self.in_scale is not None:  # AWQ: undo the per-channel weight scaling
-            xw = xw / self.in_scale.to(weight.dtype)
+        if self.in_scale is not None:
+            # AWQ: undo the per-channel weight scaling. Done in FP32 on purpose --
+            # in_scale is clamped as low as 1e-2, so x/s can be 100x and would
+            # overflow FP16's 65504 on large activations; and rounding s to FP16
+            # here would no longer exactly cancel the s folded into the weights.
+            xw = (x.float() / self.in_scale.float()).to(weight.dtype)
+        else:
+            xw = x.to(weight.dtype)
         out = F.linear(xw, weight, bias)
         return out.to(in_dtype)
 
@@ -230,15 +235,11 @@ class QuantizedLinear4bit(nn.Module):
         from .quantizer import quantize_tensor_fp4, quantize_tensor_nf4
 
         weight_cpu = linear.weight.data.cpu()
-        if scheme == "nf4":
-            quantized_weights = quantize_tensor_nf4(
-                weight_cpu, block_size=block_size,
-                outlier_threshold=outlier_threshold, double_quant=double_quant,
-            )
-        else:  # symmetric int4 has no double-quant path
-            quantized_weights = quantize_tensor_fp4(
-                weight_cpu, block_size=block_size, outlier_threshold=outlier_threshold,
-            )
+        quantizer = quantize_tensor_nf4 if scheme == "nf4" else quantize_tensor_fp4
+        quantized_weights = quantizer(
+            weight_cpu, block_size=block_size,
+            outlier_threshold=outlier_threshold, double_quant=double_quant,
+        )
         bias = linear.bias.data.clone() if linear.bias is not None else None
 
         return cls(

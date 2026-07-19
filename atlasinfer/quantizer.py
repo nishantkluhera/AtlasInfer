@@ -300,9 +300,15 @@ class QuantizedTensor4bit(NamedTuple):
 
 
 def quantize_tensor_fp4(
-    tensor: torch.Tensor, block_size: int = 64, outlier_threshold: float = 2.5
+    tensor: torch.Tensor, block_size: int = 64, outlier_threshold: float = 2.5,
+    double_quant: bool = False,
 ) -> QuantizedTensor4bit:
-    """Quantize an FP16/FP32 tensor to packed 4-bit with sparse outliers."""
+    """Quantize an FP16/FP32 tensor to packed 4-bit with sparse outliers.
+
+    ``double_quant`` compresses the per-block FP32 scales the same way the NF4
+    path does (see double_quant.py) -- the scale overhead is identical for both
+    4-bit schemes, so it is supported for both rather than special-cased to NF4.
+    """
     num_elements = tensor.numel()
     dev = tensor.device
     if num_elements == 0:
@@ -325,14 +331,21 @@ def quantize_tensor_fp4(
     unsigned = (q_flat + 8).to(torch.uint8)  # map [-7,7] -> [1,15]
     packed = ((unsigned[0::2] << 4) | (unsigned[1::2] & 0x0F)).to(torch.int8)
 
+    block_scales = scales.to(dev)
+    scales_dq = None
+    if double_quant:
+        scales_dq = double_quantize(block_scales).to(dev)
+        block_scales = torch.empty(0, dtype=torch.float32, device=dev)  # not resident
+
     return QuantizedTensor4bit(
         packed_data=packed.to(dev),
-        scales=scales.to(dev),
+        scales=block_scales,
         outlier_indices=oidx.to(dev),
         outlier_values=oval.to(dev),
         original_shape=shape,
         block_size=block_size,
         num_elements=num_elements,
+        scales_dq=scales_dq,
     )
 
 
@@ -344,7 +357,7 @@ def dequantize_tensor_fp4(qt: QuantizedTensor4bit, device: Optional[torch.device
         return torch.empty(qt.original_shape, dtype=torch.float16, device=device)
 
     packed = qt.packed_data.to(device).to(torch.uint8)
-    scales = qt.scales.to(device)
+    scales = qt.block_scales(device)  # reconstructs from double-quant if used
 
     high = (packed >> 4) & 0x0F
     low = packed & 0x0F
