@@ -1,0 +1,68 @@
+[
+  {
+    "method": "fp16",
+    "bits": 16,
+    "mb": 1136.875,
+    "avg": 0.5473827221628301,
+    "arc_easy": 0.5775,
+    "arc_challenge": 0.3796928327645051,
+    "hellaswag": 0.4955,
+    "piqa": 0.6985854189336235,
+    "winogrande": 0.585635359116022
+  },
+  {
+    "method": "AtlasInfer int8",
+    "bits": 8,
+    "mb": 739.0492668151855,
+    "avg": 0.5467977976455002,
+    "arc_easy": 0.577,
+    "arc_challenge": 0.3848122866894198,
+    "hellaswag": 0.4925,
+    "piqa": 0.6964091403699674,
+    "winogrande": 0.5832675611681136
+  },
+  {
+    "method": "AtlasInfer nf4",
+    "bits": 4,
+    "mb": 568.6694965362549,
+    "avg": 0.5542259137410517,
+    "arc_easy": 0.618,
+    "arc_challenge": 0.3771331058020478,
+    "hellaswag": 0.4915,
+    "piqa": 0.690968443960827,
+    "winogrande": 0.5935280189423836
+  },
+  {
+    "method": "AtlasInfer gptq-nf4",
+    "bits": 4,
+    "mb": 568.6656227111816,
+    "avg": 0.5465591040811197,
+    "arc_easy": 0.5985,
+    "arc_challenge": 0.37627986348122866,
+    "hellaswag": 0.4865,
+    "piqa": 0.6882480957562568,
+    "winogrande": 0.5832675611681136
+  },
+  {
+    "method": "AtlasInfer mixed-5bit",
+    "bits": 5.0,
+    "mb": 611.7428150177002,
+    "avg": 0.5548456014735599,
+    "arc_easy": 0.611,
+    "arc_challenge": 0.3779863481228669,
+    "hellaswag": 0.5005,
+    "piqa": 0.690424374319913,
+    "winogrande": 0.5943172849250198
+  },
+  {
+    "method": "bnb nf4",
+    "bits": 4,
+    "mb": 506.875,
+    "avg": 0.5504882051717772,
+    "arc_easy": 0.6115,
+    "arc_challenge": 0.35665529010238906,
+    "hellaswag": 0.495,
+    "piqa": 0.6926006528835691,
+    "winogrande": 0.5966850828729282
+  }
+]

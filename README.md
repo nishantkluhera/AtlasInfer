@@ -16,7 +16,7 @@ Everything here — the block-wise integer quantizer, the calibration-based
 sensitivity profiler, and the budget allocator — is implemented from scratch on
 top of PyTorch (no `bitsandbytes`, no `auto-gptq`), so the whole pipeline is
 inspectable in a few hundred lines. There's also an optional **fused W8A16 Triton
-kernel** that makes batch-1 decode **1.4–1.6× faster than FP16** (Linux/WSL2).
+kernel** that makes batch-1 decode **1.6–1.9× faster than FP16** (Linux/WSL2).
 
 ---
 
@@ -26,15 +26,15 @@ Three measured claims, on **current models** (Qwen3, 2025; Qwen2.5, 2024):
 
 1. **It beats bitsandbytes**, the standard accessible-quant library: AtlasInfer's
    INT8 is lossless and edges LLM.int8(), and at 4-bit its **GPTQ-NF4** path is
-   ~3–4x closer to FP16 than bitsandbytes' NF4 (see [vs bitsandbytes](#vs-bitsandbytes)).
+   ~3x closer to FP16 than bitsandbytes' NF4 (see [vs bitsandbytes](#vs-bitsandbytes)).
 2. **GPTQ error compensation closes the 4-bit gap**: on Qwen3-0.6B the 4-bit
-   penalty drops from +1.34 (plain NF4) to **+0.45** (GPTQ-NF4) at the *same*
-   memory — better than even 5-bit mixed precision.
+   penalty drops from +1.17 (plain NF4) to **+0.51** (GPTQ-NF4) at the *same*
+   memory — better than even 5-bit mixed precision (+0.65).
 3. **Per-layer mixed precision beats any uniform bit-width** at a given footprint
    — a knob bitsandbytes doesn't have.
 
-On **Qwen3-0.6B**, uniform 4-bit costs **+1.34 perplexity**; GPTQ-NF4 cuts that to
-**+0.45** at the same 4 bits, and INT8 is effectively free (**+0.01**). The blue
+On **Qwen3-0.6B**, uniform 4-bit costs **+1.17 perplexity**; GPTQ-NF4 cuts that to
+**+0.51** at the same 4 bits, and INT8 is effectively free (**+0.01**). The blue
 mixed-precision curve sits strictly below the uniform line:
 
 ![Accuracy vs memory — Qwen3-0.6B](results/Qwen_Qwen3-0.6B-Base.png)
@@ -134,13 +134,13 @@ Reproduce any row with `python benchmark.py --model <name>`.
 
 | Config | Avg bits | Weights (MB) | Perplexity | delta vs FP16 |
 | --- | ---: | ---: | ---: | ---: |
-| fp16 | 16.0 | 1136.9 | 11.803 | +0.000 |
-| uniform-int8 | 8.0 | 738.8 | 11.813 | +0.010 |
-| uniform-nf4 | 4.0 | 564.7 | 13.143 | +1.340 |
-| mixed-4.5bit | 4.5 | 587.0 | 12.682 | +0.879 |
-| mixed-5bit | 5.0 | 608.2 | 12.535 | +0.732 |
-| mixed-6bit | 5.9 | 650.0 | 12.300 | +0.497 |
-| mixed-7bit | 7.0 | 699.8 | 12.120 | +0.317 |
+| fp16 | 16.0 | 1136.9 | 11.804 | +0.000 |
+| uniform-int8 | 8.0 | 739.0 | 11.812 | +0.008 |
+| uniform-nf4 | 4.0 | 568.7 | 12.977 | +1.173 |
+| mixed-4.5bit | 4.5 | 590.6 | 12.591 | +0.787 |
+| mixed-5bit | 5.0 | 611.7 | 12.455 | +0.651 |
+| mixed-6bit | 5.9 | 652.3 | 12.227 | +0.424 |
+| mixed-7bit | 7.0 | 701.7 | 12.110 | +0.306 |
 <!-- /RESULTS:Qwen3-0.6B-Base -->
 
 <!-- RESULTS:Qwen2.5-0.5B -->
@@ -149,21 +149,22 @@ Reproduce any row with `python benchmark.py --model <name>`.
 | Config | Avg bits | Weights (MB) | Perplexity | delta vs FP16 |
 | --- | ---: | ---: | ---: | ---: |
 | fp16 | 16.0 | 942.3 | 12.279 | +0.000 |
-| uniform-int8 | 8.0 | 620.5 | 12.286 | +0.007 |
-| uniform-nf4 | 4.0 | 479.6 | 13.222 | +0.943 |
-| mixed-4.5bit | 4.5 | 498.8 | 12.878 | +0.599 |
-| mixed-5bit | 5.0 | 515.2 | 12.778 | +0.499 |
-| mixed-6bit | 6.0 | 550.8 | 12.660 | +0.381 |
-| mixed-7bit | 6.9 | 586.1 | 12.561 | +0.282 |
+| uniform-int8 | 8.0 | 620.9 | 12.279 | +0.001 |
+| uniform-nf4 | 4.0 | 484.1 | 13.067 | +0.788 |
+| mixed-4.5bit | 4.5 | 502.8 | 12.812 | +0.533 |
+| mixed-5bit | 5.0 | 518.8 | 12.739 | +0.460 |
+| mixed-6bit | 6.0 | 553.6 | 12.638 | +0.359 |
+| mixed-7bit | 7.0 | 589.1 | 12.591 | +0.313 |
 
 At ~4.5 bits — essentially the same footprint as uniform 4-bit NF4 — mixed
-precision roughly **halves** the perplexity penalty (here +0.94 → +0.60) by
-spending the extra half-bit only on the layers that hurt most.
+precision cuts the perplexity penalty by about a third (here +0.79 → +0.53) by
+spending the extra half-bit only on the layers that hurt most; GPTQ-NF4 does
+better still at the *same* 4-bit footprint (+0.48, see [vs bitsandbytes](#vs-bitsandbytes)).
 <!-- /RESULTS:Qwen2.5-0.5B -->
 
 Also validated on older architectures — GPT-2 (124M) and Pythia-410M / 1.4B —
 under [`results/`](results/); the same mixed-precision win holds there too (it's
-largest on models where uniform 4-bit is most lossy, e.g. +5.7→+1.4 on Pythia-410M).
+largest on models where uniform 4-bit is most lossy, e.g. +5.5→+1.3 on Pythia-410M).
 
 **Reading the tables:** INT8 is effectively lossless. Uniform 4-bit (NF4) is much
 smaller but costs real perplexity. The mixed-precision rows land *between* those
@@ -199,16 +200,18 @@ dequant-GEMM** Triton kernels for both INT8 (`W8A16`) and packed INT4 (`W4A16`):
 they read the low-bit weights directly (half / a quarter of FP16's bytes),
 dequantize them in-register, and do the matmul in a single pass — no full-weight
 materialization. At batch-1 decode (memory-bandwidth bound) both beat FP16.
-Measured on an RTX 3060 (`bench_triton_kernel.py`, best-of-3):
+Measured on an RTX 3060 under WSL2 (`bench_triton_kernel.py`, best-of-3, torch
+2.5.1+cu124 / Triton 3.1.0; full table + correctness notes in
+[results/triton_kernel_rtx3060.md](results/triton_kernel_rtx3060.md)):
 
 | matmul shape (M, K, N) | fp16 | fused W8A16 | fused W4A16 | W8 vs fp16 | W4 vs fp16 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| (1, 4096, 4096)  | 0.120 ms | 0.078 ms | 0.080 ms | **1.55x** | **1.51x** |
-| (1, 4096, 11008) | 0.297 ms | 0.208 ms | 0.152 ms | **1.43x** | **1.95x** |
-| (1, 5120, 5120)  | 0.177 ms | 0.105 ms | 0.101 ms | **1.68x** | **1.76x** |
+| (1, 4096, 4096)  | 0.156 ms | 0.099 ms | 0.088 ms | **1.58x** | **1.78x** |
+| (1, 4096, 11008) | 0.337 ms | 0.173 ms | 0.123 ms | **1.95x** | **2.74x** |
+| (1, 5120, 5120)  | 0.198 ms | 0.112 ms | 0.109 ms | **1.78x** | **1.82x** |
 
 The edge narrows as batch grows and the matmul becomes compute- rather than
-bandwidth-bound (≈1.0–1.4x at M=16), exactly as expected. The W8A16 path is
+bandwidth-bound (≈1.0–1.5x at M=16), exactly as expected. The W8A16 path is
 near-lossless (<1% error); the W4A16 kernel uses per-channel int4 (coarser than
 the default block-wise + outlier INT4), so it trades a little accuracy for the
 4-bit bandwidth — use it when speed matters most. Triton is Linux/GPU-only, so
@@ -290,8 +293,11 @@ mattered — (2) the int8/int4 weights are stored **transposed `(K, N)`** so the
 kernel's fast tile axis is contiguous and the weight loads **coalesce** (with the
 natural `(N, K)` layout each load was strided by K, which Ampere hides via
 `cp.async` but Turing can't). Autotuning alone left the T4 ~7× slow — confirming
-the bottleneck was the access pattern, not the schedule. *(Post-fix T4 kernel
-throughput: re-measure with `bench_triton_kernel.py` — pending.)*
+the bottleneck was the access pattern, not the schedule. The coalesced-layout fix
+is in `quantize_w8a16`/`quantize_w4a16`; end-to-end T4 kernel throughput is
+reproducible from the [Kaggle notebook](notebooks/kaggle_benchmark.ipynb) with
+`bench_triton_kernel.py` (Triton is Linux/GPU-only, so it can't run on the Windows
+dev box these perplexity numbers came from).
 
 ### vs bitsandbytes (the accessible-quant baseline)
 
@@ -302,22 +308,113 @@ FP16** per method (lower is better; INT8 columns are 8-bit, the rest 4-bit):
 
 | Model | Atlas int8 | bnb int8 | bnb nf4 | Atlas nf4 | **Atlas gptq-nf4** |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Qwen3-0.6B (2025) | +0.009 | +0.057 | +1.834 | +1.339 | **+0.453** |
-| Qwen2.5-0.5B (2024) | +0.007 | +0.070 | +1.323 | +0.943 | **+0.558** |
-| Pythia-1.4B | −0.005 | +0.056 | +0.922 | +0.754 | **+0.362** |
-| Pythia-410M | +0.024 | +0.121 | +5.938 | +5.681 | **+4.019** |
+| Qwen3-0.6B (2025) | +0.008 | +0.057 | +1.834 | +1.173 | **+0.508** |
+| Qwen2.5-0.5B (2024) | +0.001 | +0.070 | +1.323 | +0.788 | **+0.480** |
+| Pythia-1.4B | +0.003 | +0.036 | +0.760 | +0.713 | **+0.267** |
+| Pythia-410M | +0.024 | +0.122 | +5.939 | +5.466 | **+3.883** |
 
 On **every** model: AtlasInfer's **INT8 matches/beats** bitsandbytes' LLM.int8(),
 and at **4-bit, GPTQ-NF4 is the best method** — beating bnb's NF4, plain NF4, and
-(on the Qwen/Pythia-1.4B models) even AtlasInfer's own 5-bit mixed precision, at
-the same 4-bit memory. The win is largest on the modern models (~3–4× closer to
-FP16 than bnb); even the hard Pythia-410M case improves +5.9→+4.0. (bnb is ~10–13%
-smaller at 4-bit — it double-quantizes its scales, a roadmap item.) Per-model
-detail incl. mixed-precision and symmetric-int4 rows:
-[Qwen3-0.6B](results/comparison_Qwen3-0.6B-Base.md) ·
-[Qwen2.5-0.5B](results/comparison_Qwen2.5-0.5B.md) ·
-[Pythia-1.4B](results/comparison_pythia-1.4b.md) ·
-[Pythia-410M](results/comparison_pythia-410m.md).
+(on Qwen3-0.6B and Pythia-1.4B) even AtlasInfer's own 5-bit mixed precision, at
+the same 4-bit memory. The win is largest on the modern models (~3× closer to
+FP16 than bnb); even the hard Pythia-410M case improves +5.9→+3.9. (Plain bnb NF4
+is ~10–13% smaller at 4-bit because it double-quantizes its scales; the
+[`--double-quant`](#pushing-further-double-quant-awq-and-2-bit) flag narrows that
+at unchanged perplexity, with the residual being AtlasInfer's sparse FP16 outliers
+— which bnb omits and which buy the accuracy lead above.)
+Per-model detail incl. mixed-precision and symmetric-int4 rows:
+[Qwen3-0.6B](results/comparison_Qwen_Qwen3-0.6B-Base.md) ·
+[Qwen2.5-0.5B](results/comparison_Qwen_Qwen2.5-0.5B.md) ·
+[Pythia-1.4B](results/comparison_EleutherAI_pythia-1.4b.md) ·
+[Pythia-410M](results/comparison_EleutherAI_pythia-410m.md).
+
+### Downstream accuracy (not just perplexity)
+
+Perplexity is a proxy; the accuracy that matters is on real tasks. Same quantized
+models, run through `lm-evaluation-harness` on five zero-shot multiple-choice
+tasks (ARC-easy/challenge, HellaSwag, PIQA, WinoGrande), 2000 examples each
+(`python eval_downstream.py --model Qwen/Qwen2.5-0.5B --limit 2000`). Mean accuracy
+across the five tasks, on **Qwen2.5-0.5B**:
+
+| Method | ~bits | Weights (MB) | Avg acc (5 tasks) | Δ vs FP16 |
+| --- | ---: | ---: | ---: | ---: |
+| fp16 | 16 | 942 | 0.5325 | +0.0000 |
+| AtlasInfer int8 | 8 | 621 | 0.5328 | +0.0003 |
+| AtlasInfer mixed-5bit | 5.0 | 519 | 0.5320 | −0.0005 |
+| **AtlasInfer gptq-nf4** | 4 | 484 | 0.5314 | **−0.0010** |
+| AtlasInfer nf4 | 4 | 484 | 0.5234 | −0.0090 |
+| bnb nf4 | 4 | 430 | 0.5209 | −0.0115 |
+
+At ~0.5-point standard error on the 5-task mean (2000 examples/task), INT8,
+mixed-5bit, and GPTQ-NF4 are all **within noise of FP16** — the accuracy is
+preserved, not just the perplexity. The two *plain* 4-bit methods lose a real
+~1 point, and AtlasInfer's GPTQ-NF4 recovers essentially all of that gap while
+still beating bnb's NF4 by ~1 point at 4-bit. Per-task numbers and the Qwen3-0.6B
+run: [Qwen2.5-0.5B](results/downstream_Qwen_Qwen2.5-0.5B.md) ·
+[Qwen3-0.6B](results/downstream_Qwen_Qwen3-0.6B-Base.md).
+
+### Pushing further: double-quant, AWQ, and 2-bit
+
+Three additions on top of the 4-bit story above, each implemented from scratch.
+The framing is deliberately narrow: they push AtlasInfer to the accessible-quant
+frontier (matching the memory *and* accuracy levers bitsandbytes/AWQ/GPTQ have),
+not past the research frontier — the honest boundary is spelled out per item.
+
+**1. Double-quantized scales** ([`double_quant.py`](atlasinfer/double_quant.py),
+`--double-quant`). Block-wise NF4 stores one FP32 scale per 64 weights — ~0.5
+bit/weight of overhead, and exactly the ~10–13% memory gap to bnb. Quantizing the
+scales themselves to INT8 + per-group (scale, offset), the QLoRA trick, recovers
+most of it. Measured on Qwen2.5-0.5B (WikiText-2, 40k tokens, seed 0):
+
+| Method | Weights (MB) | Perplexity | Δ vs FP16 | vs bnb NF4 mem |
+| --- | ---: | ---: | ---: | ---: |
+| nf4 | 484.1 | 13.067 | +0.788 | 1.12× |
+| **nf4+dq** | 468.2 | 13.066 | **+0.788** | 1.09× |
+| gptq-nf4 | 484.0 | 12.758 | +0.479 | 1.12× |
+| **gptq-nf4+dq** | 468.2 | 12.757 | **+0.478** | 1.09× |
+
+Double-quant removes the scale overhead at **zero perplexity cost** (+0.788 →
++0.788), narrowing the 4-bit memory gap to bnb from +12.5% to +8.8%. It doesn't
+fully close it — the residual is AtlasInfer's sparse FP16 outliers, which bnb omits
+and which are what keep its accuracy ahead. So **gptq-nf4+dq is the best 4-bit
+config here**: it beats bnb NF4 on accuracy by a wide margin (**+0.48 vs +1.32**)
+at within ~9% of bnb's memory. Reproduce:
+`python compare_baselines.py --model Qwen/Qwen2.5-0.5B --double-quant`
+(and [results/double_quant_Qwen_Qwen2.5-0.5B.md](results/double_quant_Qwen_Qwen2.5-0.5B.md)).
+
+**2. AWQ activation-aware scaling** ([`awq.py`](atlasinfer/awq.py)). A second,
+independent route to the 4-bit accuracy tier. Rather than keep the salient
+(high-activation) input channels in FP16 like the mixed-precision path, AWQ scales
+those weight columns *up* before NF4 quantization and divides the activation back
+out at run time — so the salient weights round more finely, with the scaling
+cancelling exactly (`(W·diag(s))·(x/s) = W·x`). A per-layer exponent `α∈[0,1]` is
+grid-searched to minimize each layer's quantized output error. On Qwen2.5-0.5B:
+
+| Method | Weights (MB) | Perplexity | Δ vs FP16 |
+| --- | ---: | ---: | ---: |
+| nf4 | 484.1 | 13.067 | +0.788 |
+| **awq-nf4** | 513.5 | 12.762 | **+0.483** |
+| gptq-nf4 | 484.0 | 12.758 | +0.479 |
+
+AWQ (**+0.483**) lands right on GPTQ (+0.479) from a completely different,
+Hessian-free mechanism — roughly halving the plain-NF4 penalty. The honest catch:
+it uses *more* memory than plain NF4 here (513 vs 484 MB), because the per-channel
+up-scaling widens per-block variance and pushes more weights over the sparse-outlier
+threshold — so GPTQ is the more memory-efficient route to the same accuracy in this
+implementation, and the two are complementary rather than redundant. Full table:
+[results/awq_Qwen_Qwen2.5-0.5B.md](results/awq_Qwen_Qwen2.5-0.5B.md).
+
+**3. Sub-4-bit vector quantization** —
+*experimental* ([`codebook.py`](atlasinfer/codebook.py)). A single-codebook vector
+quantizer (group `d` weights, round each vector to the nearest of 256 k-means
+centroids → `8/d` bits/weight) that reaches the 2–3 bit range scalar quantization
+can't. It's implemented and unit-tested for correctness, but the accuracy it would
+need to be *useful* at 2 bit is the current research frontier (AQLM, QuIP#, QTIP),
+established on 7B models the 6 GB dev GPU here can't run — so this ships as a
+**clearly-labeled scaffold with no SOTA claim**, and the natural next steps
+(residual/additive codebooks, incoherence pre-processing) are called out in the
+module. It's the honest edge of what this repo demonstrates versus what it merely
+sets up.
 
 ---
 
@@ -349,10 +446,12 @@ print(engine.generate("The future of on-device AI is", max_tokens=40))
 
 # Best 4-bit accuracy: GPTQ error-compensated NF4 (needs a tokenizer + calib text).
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from atlasinfer import quantize_model_gptq
+from atlasinfer import quantize_model_gptq, quantize_model_awq
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B-Base")
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B-Base").cuda()
-quantize_model_gptq(model, tokenizer=tok)   # ~3-4x closer to FP16 than bnb NF4
+quantize_model_gptq(model, tokenizer=tok)                    # ~3x closer to FP16 than bnb NF4
+quantize_model_gptq(model, tokenizer=tok, double_quant=True) # + QLoRA scale compression, same accuracy
+quantize_model_awq(model, tokenizer=tok)                     # AWQ: same 4-bit tier, Hessian-free route
 ```
 
 CLI:
@@ -393,17 +492,25 @@ Linux/CUDA-only and version-fragile; each harness **skips any that fail to
 import** with a clear note, so a partial install still produces a full table of
 whatever's present.
 
-### Bigger models (7–13B) on a free Kaggle GPU
+### Bigger models (7–13B) on a cloud GPU
 
-The benchmarks here cap at ~1.4B (6 GB laptop). To go bigger, run the ready-made
-[`notebooks/kaggle_benchmark.ipynb`](notebooks/kaggle_benchmark.ipynb) on Kaggle's
-free **T4×2 (32 GB)** or **P100 (16 GB)**: it clones, installs, and runs the full
-suite on a model you pick. A single 16 GB GPU fits ~≤4B for the FP16 baseline;
-**`--device-map`** shards across both T4s for 7–13B:
+The benchmarks here cap at ~1.4B (6 GB laptop). To go bigger — and to run the
+head-to-head against **real bitsandbytes / GPTQ / AWQ** (Linux/CUDA-only, so they
+don't install on the Windows dev box) — use a cloud GPU:
+
+- **Lightning AI** (single A100/L4): a priority-ordered runner + hour-budget plan
+  in [`docs/lightning_7b.md`](docs/lightning_7b.md) — `bash run_lightning.sh compare`
+  gives the AtlasInfer-vs-bitsandbytes head-to-head in ~30 min, across a **spread of
+  families** (SmolLM3 / Phi-4-mini / Mistral / OLMo-2 / Qwen3, + gated Llama/Gemma),
+  not just one vendor.
+- **Kaggle** (free T4×2 / P100): the ready-made
+  [`notebooks/kaggle_benchmark.ipynb`](notebooks/kaggle_benchmark.ipynb) clones,
+  installs, and runs the full suite. A single 16 GB GPU fits ~≤4B for the FP16
+  baseline; **`--device-map`** shards across both T4s for 7–13B:
 
 ```bash
-python benchmark.py        --model Qwen/Qwen2.5-7B --device-map
-python compare_baselines.py --model Qwen/Qwen2.5-7B --device-map
+python benchmark.py        --model Qwen/Qwen3.5-9B-Base --device-map
+python compare_baselines.py --model Qwen/Qwen3.5-9B-Base --device-map
 ```
 
 Two changes make this practical: GPTQ now uses a **block-batched** column update
@@ -423,6 +530,9 @@ atlasinfer/
 ├── sensitivity.py   # calibration-based per-layer error profiler
 ├── allocator.py     # exact (DP) + greedy budget allocators
 ├── gptq.py          # GPTQ error-compensated NF4 (Hessian-based) + outliers
+├── awq.py           # AWQ activation-aware per-channel scaling on the NF4 path
+├── double_quant.py  # QLoRA-style double-quantized block scales (--double-quant)
+├── codebook.py      # EXPERIMENTAL sub-4-bit vector-quantized codebook (unvalidated)
 ├── patcher.py       # in-place layer replacement (nn.Linear & Conv1D)
 ├── offload.py       # optional CPU<->GPU layer streaming
 ├── triton_kernels.py# fused W8A16/W4A16 dequant-GEMM kernels (Linux/WSL2, guarded)
@@ -448,13 +558,17 @@ docs/wsl_triton.md   # WSL2 setup for the Triton kernel
   card once activation quant/dequant overhead is counted, and can't do batch-1
   decode, so it isn't used. The fused dequant kernel is the right approach.
 - **Where it sits in the literature.** The pieces are established ideas —
-  sensitivity-driven mixed precision (HAWQ, SqueezeLLM), NF4 (QLoRA), Hessian-based
-  error compensation (GPTQ). AtlasInfer is a clean, self-contained, from-scratch
-  implementation that *combines* them (GPTQ on top of NF4 + sparse outliers, under
-  an exact budget allocator) with reproducible benchmarks — not a new algorithm,
-  but it lands at the GPTQ/AWQ accuracy tier at 4-bit, ahead of the bitsandbytes
-  baseline. (It does *not* do 2–3 bit; that needs vector/trellis codebooks like
-  AQLM/QuIP#/QTIP.)
+  sensitivity-driven mixed precision (HAWQ, SqueezeLLM), NF4 + double-quant (QLoRA),
+  Hessian-based error compensation (GPTQ), activation-aware scaling (AWQ). AtlasInfer
+  is a clean, self-contained, from-scratch implementation that *combines* them (GPTQ
+  and AWQ on top of NF4 + sparse outliers + double-quantized scales, under an exact
+  budget allocator) with reproducible benchmarks — not a new algorithm, but it lands
+  at the GPTQ/AWQ accuracy tier at 4-bit, ahead of the bitsandbytes baseline. For
+  **2–3 bit** there's now an *experimental* single-codebook vector-quantization path
+  ([`codebook.py`](atlasinfer/codebook.py)) — implemented and unit-tested, but
+  explicitly **not validated at scale** against the AQLM/QuIP#/QTIP frontier (which
+  is established on 7B models this repo's 6 GB dev GPU can't run), so no
+  SOTA-beating claim is made there.
 - **GPTQ is calibration-hungry, memory-heavy, and compute-heavy** — three gotchas
   I hit and fixed. (1) Too few tokens -> rank-deficient Hessian -> compensation
   *hurts* (~1k tokens made 4-bit worse than plain NF4); ~65k tokens (128×512)
@@ -471,13 +585,20 @@ docs/wsl_triton.md   # WSL2 setup for the Triton kernel
 
 - **Done:** NF4 codebook for the 4-bit tier (beats bitsandbytes' NF4).
 - **Done:** GPTQ Hessian-based error compensation on the NF4 path — takes 4-bit
-  to the GPTQ/AWQ tier (Qwen3-0.6B +0.45, Qwen2.5-0.5B +0.56), see above.
-- **Done:** fused W8A16 **and** W4A16 Triton kernels (1.4–1.95x over FP16 at
-  decode), wired into `AtlasInference` (`kernel="auto"`).
-- Double-quantize the block scales (as bitsandbytes does) to close the remaining
-  ~10% memory gap at 4-bit.
-- 2–3 bit via a vector/trellis codebook (AQLM/QuIP#/QTIP family) — the current
-  frontier we don't yet reach.
+  to the GPTQ/AWQ tier (Qwen3-0.6B +0.51, Qwen2.5-0.5B +0.48), see above.
+- **Done:** AWQ activation-aware scaling on the NF4 path
+  ([`awq.py`](atlasinfer/awq.py)) — a second, complementary route to the GPTQ/AWQ
+  4-bit tier, from scratch.
+- **Done:** double-quantized block scales
+  ([`double_quant.py`](atlasinfer/double_quant.py), `--double-quant`) — removes the
+  FP32 scale overhead at ~unchanged perplexity, narrowing the 4-bit memory gap to
+  bnb.
+- **Done:** fused W8A16 **and** W4A16 Triton kernels (1.6–2.7× over FP16 at
+  batch-1 decode, WSL2/RTX 3060), wired into `AtlasInference` (`kernel="auto"`).
+- **Experimental:** 2–3 bit via a single-codebook vector quantizer
+  ([`codebook.py`](atlasinfer/codebook.py)) — the direction toward the
+  AQLM/QuIP#/QTIP frontier; correctness-tested, **not yet validated at scale**.
+  Next: residual/additive codebooks and incoherence pre-processing.
 - Activation/KV-cache quantization, not just weights.
 
 ## License

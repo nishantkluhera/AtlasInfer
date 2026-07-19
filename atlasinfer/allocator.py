@@ -178,11 +178,15 @@ def allocate_optimal(
         dp = new_dp
         back.append(layer_back)
 
-    # Best feasible capacity = min error over all reachable capacities.
-    best_c, best_err = min(
-        ((c, dp[c]) for c in range(num_buckets + 1) if dp[c] < INF),
-        key=lambda t: t[1],
-    )
+    # Best feasible capacity = min error over all reachable capacities. On ties,
+    # prefer the *largest* capacity: two budgets that admit the same minimal error
+    # should not collapse to the same allocation (a 7-bit target must not return
+    # the 6-bit result just because upgrading the remaining insensitive layers
+    # buys ~0 error). Given equal predicted error, spending the extra budget on
+    # higher precision is never worse and is more robust to profile noise.
+    reachable = [c for c in range(num_buckets + 1) if dp[c] < INF]
+    best_err = min(dp[c] for c in reachable)
+    best_c = max(c for c in reachable if dp[c] <= best_err + 1e-12)
 
     # Reconstruct per-layer choices.
     alloc: Dict[str, str] = {}
