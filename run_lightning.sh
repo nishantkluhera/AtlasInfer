@@ -47,6 +47,9 @@ DEVICE_MAP="${DEVICE_MAP:-}"      # set to "--device-map" for 13B+ across >1 GPU
 FAMILIES="${FAMILIES:-mistralai/Mistral-7B-v0.3 Qwen/Qwen3-8B-Base microsoft/Phi-4-mini-instruct}"
 AUTOSTOP="${AUTOSTOP:-0}"
 SUMMARY="results/_logs/overnight_summary.txt"
+# Install into an isolated venv (see setup()). USE_VENV=0 uses the host env.
+USE_VENV="${USE_VENV:-1}"
+VENV="${VENV:-.venv}"
 
 echo "== AtlasInfer 7B validation | stage=$STAGE model=$MODEL tokens=$EVAL_TOKENS =="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
@@ -66,14 +69,38 @@ echo "python: $PY ($("$PY" --version 2>&1))"
 LOCK="results/_logs/.overnight.lock"
 
 setup() {
-  # Use the interpreter we resolved, and its own pip -- `pip` may not be on PATH.
+  # Install into an ISOLATED venv by default. Managed cloud images (Lightning's
+  # `cloudspace` conda env in particular) often ship a partly-broken environment:
+  # half-installed distributions (`~umpy`), missing dist-info dirs that make pip
+  # abort with OSError, and scipy/sklearn compiled against NumPy 1.x while numpy
+  # itself is 2.x -- which breaks `import transformers` via sklearn->scipy with
+  # "numpy.core.multiarray failed to import". A clean venv sidesteps all of it.
+  # Set USE_VENV=0 to install into the host environment instead.
+  if [ "$USE_VENV" = "1" ]; then
+    if [ ! -x "$VENV/bin/python" ]; then
+      echo "Creating isolated venv at $VENV (host env may have broken/ABI-conflicting packages)..."
+      "$PY" -m venv "$VENV" || { echo "WARN: venv creation failed; falling back to host env"; USE_VENV=0; }
+    fi
+    if [ -x "$VENV/bin/python" ]; then
+      PY="$(cd "$VENV/bin" && pwd)/python"     # later stages inherit this
+      echo "using venv python: $PY"
+      "$PY" -m pip install -q -U pip setuptools wheel
+      # Fresh CUDA torch (the venv starts empty; ~2-4 min).
+      "$PY" -m pip install -q torch || { echo "ERROR: torch install failed."; return 1; }
+    fi
+  fi
   "$PY" -m pip install -q -e '.[benchmark,eval]' bitsandbytes || {
     echo "ERROR: core install failed. Nothing downstream can work."; return 1; }
   # Real GPTQ + AWQ reference baselines (optional; skip if the install is painful):
   "$PY" -m pip install -q optimum gptqmodel autoawq || echo "(external GPTQ/AWQ baselines optional -- continuing without them)"
   "$PY" -c "import torch;print('CUDA', torch.cuda.is_available(), torch.cuda.get_device_name(0))" || return 1
-  "$PY" -c "import atlasinfer, transformers, datasets; print('imports OK')" || {
-    echo "ERROR: atlasinfer/transformers/datasets not importable after install."; return 1; }
+  # Full import chain, incl. the scipy/sklearn path transformers pulls in. This is
+  # the check that would have caught the NumPy 1.x/2.x ABI break immediately.
+  "$PY" -c "import numpy, scipy, sklearn, transformers, datasets, atlasinfer; print('imports OK; numpy', numpy.__version__)" || {
+    echo "ERROR: import check failed -- classic cause is numpy 2.x with"
+    echo "       numpy-1.x-compiled scipy/sklearn. An isolated venv (USE_VENV=1)"
+    echo "       avoids it; if you forced USE_VENV=0, pin 'numpy<2' in the host env."
+    return 1; }
   # Cheap smoke on the latest small model to confirm env + that AtlasInfer quantizes
   # the (hybrid) arch cleanly BEFORE spending 9B hours:
   "$PY" compare_baselines.py --model Qwen/Qwen3.5-0.8B-Base --eval-tokens 4000 --skip awq gptq

@@ -178,6 +178,16 @@ the JSON — that's intended: it keeps the README honest).
 
 ## Gotchas
 
+- **The Studio's shared conda env is often broken — install into a venv.** Lightning's
+  `cloudspace` env can ship half-installed distributions (`Ignoring invalid
+  distribution ~umpy`) and missing `dist-info` dirs that make `pip` abort with
+  `OSError`, and it commonly has `numpy 2.x` alongside `scipy`/`sklearn` compiled
+  for NumPy 1.x. That last one breaks **every** harness, because `transformers`
+  imports `sklearn` → `scipy` → `ImportError: numpy.core.multiarray failed to
+  import`. `setup` therefore builds an isolated `.venv` by default (adds ~2-4 min
+  for a fresh torch wheel, and removes the whole class of failure). Override with
+  `USE_VENV=0` to use the host env — then pin `numpy<2` yourself.
+
 - **External baselines are version-fragile.** If `gptqmodel`/`autoawq` fail to
   install or import against the current `transformers`, the harness prints a SKIP
   and continues — you still get bnb + all AtlasInfer methods. Don't fight it.
