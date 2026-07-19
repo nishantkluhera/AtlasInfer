@@ -51,24 +51,41 @@ SUMMARY="results/_logs/overnight_summary.txt"
 echo "== AtlasInfer 7B validation | stage=$STAGE model=$MODEL tokens=$EVAL_TOKENS =="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
 
+# --- preflight: fail loudly HERE rather than 7 stages deep -------------------
+# Must run from the repo root (pip install -e . and the harness paths depend on it).
+if [ ! -f pyproject.toml ] || [ ! -d atlasinfer ]; then
+  echo "ERROR: run this from the AtlasInfer repo root (no pyproject.toml/atlasinfer here)."
+  echo "       cd into the cloned repo first:  cd AtlasInfer"
+  exit 1
+fi
+# Some images ship only python3 (no `python` alias) -- that alone fails every stage.
+PY="$(command -v python || command -v python3)"
+if [ -z "$PY" ]; then echo "ERROR: no python/python3 on PATH."; exit 1; fi
+echo "python: $PY ($("$PY" --version 2>&1))"
+# Only one overnight run at a time, or two processes interleave into the summary.
+LOCK="results/_logs/.overnight.lock"
+
 setup() {
-  # Core suite + bitsandbytes (the always-available 4-bit baseline on Linux/CUDA).
-  pip install -q -e '.[benchmark,eval]' bitsandbytes
+  # Use the interpreter we resolved, and its own pip -- `pip` may not be on PATH.
+  "$PY" -m pip install -q -e '.[benchmark,eval]' bitsandbytes || {
+    echo "ERROR: core install failed. Nothing downstream can work."; return 1; }
   # Real GPTQ + AWQ reference baselines (optional; skip if the install is painful):
-  pip install -q optimum gptqmodel autoawq || echo "(external GPTQ/AWQ baselines optional -- continuing without them)"
-  python -c "import torch;print('CUDA', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+  "$PY" -m pip install -q optimum gptqmodel autoawq || echo "(external GPTQ/AWQ baselines optional -- continuing without them)"
+  "$PY" -c "import torch;print('CUDA', torch.cuda.is_available(), torch.cuda.get_device_name(0))" || return 1
+  "$PY" -c "import atlasinfer, transformers, datasets; print('imports OK')" || {
+    echo "ERROR: atlasinfer/transformers/datasets not importable after install."; return 1; }
   # Cheap smoke on the latest small model to confirm env + that AtlasInfer quantizes
   # the (hybrid) arch cleanly BEFORE spending 9B hours:
-  python compare_baselines.py --model Qwen/Qwen3.5-0.8B-Base --eval-tokens 4000 --skip awq gptq
+  "$PY" compare_baselines.py --model Qwen/Qwen3.5-0.8B-Base --eval-tokens 4000 --skip awq gptq
 }
 # Head-to-head vs bitsandbytes (+ real GPTQ/AWQ if installed). THE credibility result.
-compare()    { python compare_baselines.py --model "$MODEL" --eval-tokens "$EVAL_TOKENS" --double-quant $DEVICE_MAP; }
+compare()    { "$PY" compare_baselines.py --model "$MODEL" --eval-tokens "$EVAL_TOKENS" --double-quant $DEVICE_MAP; }
 # Uniform + mixed-precision perplexity/memory Pareto (the repo's signature result).
-sweep()      { python benchmark.py --model "$MODEL" --eval-tokens "$EVAL_TOKENS" --bits 4.5 5 6 7 $DEVICE_MAP; }
+sweep()      { "$PY" benchmark.py --model "$MODEL" --eval-tokens "$EVAL_TOKENS" --bits 4.5 5 6 7 $DEVICE_MAP; }
 # Downstream zero-shot accuracy (ARC/HellaSwag/PIQA/WinoGrande) -- tasks, not just ppl.
-downstream() { python eval_downstream.py --model "$MODEL" --limit 1000 $DEVICE_MAP; }
+downstream() { "$PY" eval_downstream.py --model "$MODEL" --limit 1000 $DEVICE_MAP; }
 # Decode tok/s + peak GPU memory (single-GPU only; do NOT pass --device-map).
-latency()    { python bench_latency.py --model "$MODEL"; }
+latency()    { "$PY" bench_latency.py --model "$MODEL"; }
 
 # ---- unattended runner -------------------------------------------------------
 # Each stage: own log file, timed, failure-tolerant, recorded in a summary table.
@@ -88,12 +105,29 @@ _stage() {                      # _stage <label> <fn> [model]
 
 overnight() {
   local T0=$SECONDS
-  mkdir -p results/_logs; : > "$SUMMARY"
+  mkdir -p results/_logs
+  # Refuse to start a second concurrent run -- two would interleave into $SUMMARY.
+  if ! ( set -o noclobber; : > "$LOCK" ) 2>/dev/null; then
+    echo "ERROR: an overnight run is already in progress (lock: $LOCK)."
+    echo "       If that's stale, delete it:  rm $LOCK"
+    exit 1
+  fi
+  trap 'rm -f "$LOCK"' EXIT
+  : > "$SUMMARY"
   echo "Overnight run started $(date '+%F %T')"
   echo "Cross-family compare: $FAMILIES"
   echo "Depth model:          $MODEL"
 
+  # setup is a HARD prerequisite: if the env isn't installed, every later stage
+  # fails in seconds and the "keep going" policy just burns GPU hours for nothing.
   _stage setup setup
+  if grep -q '^FAIL  setup' "$SUMMARY"; then
+    echo ""
+    echo "ABORTING: setup failed, so nothing downstream can succeed."
+    echo "Root cause is in results/_logs/setup.log -- fix that and re-run."
+    tail -25 results/_logs/setup.log 2>/dev/null
+    return 1
+  fi
   # 1) Cross-family headline: `compare` on each family (the credibility result).
   for m in $FAMILIES; do
     _stage "compare_$(echo "$m" | tr '/:' '__')" compare "$m"
