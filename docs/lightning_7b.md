@@ -105,6 +105,33 @@ done
 huggingface-cli login          # or: export HF_TOKEN=hf_xxx
 ```
 
+## 3a. Unattended / overnight — one command, then walk away
+
+```bash
+mkdir -p results/_logs
+nohup bash run_lightning.sh overnight > results/_logs/overnight.log 2>&1 &
+```
+
+Runs `setup`, then `compare` across **3 ungated families** (nothing can stall on a
+Hugging Face login while you're asleep), then `sweep` + `downstream` + `latency` on
+the main model. Each stage writes its own log, **a failing stage never kills the
+run**, and a summary table prints at the end. ~5 h ≈ 12 credits on an L40S.
+
+`nohup … &` keeps it alive if your browser disconnects. In the morning:
+
+```bash
+tail -40 results/_logs/overnight.log        # summary table is at the bottom
+cat results/_logs/overnight_summary.txt     # per-stage OK/FAIL + minutes
+```
+
+Options: `FAMILIES="a b c"` to change the family list (add gated Gemma/Llama only
+if you ran `huggingface-cli login` first), `AUTOSTOP=1` to try powering the machine
+off when done so idle credits aren't burned — verify it works for your Studio, and
+set the Lightning UI idle-timeout as the reliable backstop.
+
+> Prefer a **non-interruptible** GPU for an unattended run: an interruptible one can
+> be preempted mid-stage, and results are only written when a stage completes.
+
 ## 3. Run — priority-ordered so you can stop when hours run out
 
 ```bash
