@@ -42,3 +42,14 @@ the ones that moved — which is the intended behaviour, not a bug.
 Note the numbers depend on the GPU and library versions; each `.json` records the
 GPU, torch version, seed and eval-token count that produced it. Compare like with
 like.
+
+**Memory figures are `transformers`-version-dependent.** The same GPT-2 reports
+249.4 MB under transformers 5.1 (Windows) and 237.4 MB under 5.12 (WSL2), because
+the versions differ in whether a tied `lm_head` weight is materialised in
+`model.parameters()`. Perplexity is unaffected. So:
+
+- never mix memory numbers from different runs into one table;
+- when a table's memory column matters, regenerate the whole table in one run.
+
+This is why every `.json` carries its own provenance block — the numbers are only
+comparable within a run, not across them.

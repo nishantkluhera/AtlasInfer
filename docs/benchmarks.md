@@ -133,7 +133,8 @@ not the speedup — it's how much of that headroom the kernel actually captures:
 | (16, 4096, 4096) | 0.134 ms | 0.088 ms | 0.129 ms | 1.52× (76%) | 1.04× (26%) |
 
 **Being straight about what this shows.** The FP16 baseline is *not* a straw man —
-`F.linear` reaches 267 GB/s, about 93% of the card's ~288 GB/s peak. Against it,
+`F.linear` reaches 285-300 GB/s, about 85-89% of the card's 336 GB/s peak
+(192-bit at 14 Gbps; nvidia-smi reports a 7001 MHz memory clock). Against it,
 **W8A16 is genuinely good**: 1.95× of an available 2.0×. **W4A16 is not**: it
 captures only 26–68% of its headroom, and by M=16 it has collapsed to 1.04× —
 where [Marlin](https://arxiv.org/abs/2408.11743) sustains close to the full 4×.

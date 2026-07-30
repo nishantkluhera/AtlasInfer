@@ -226,7 +226,7 @@ decode" is not a measurement that exists in this repository.
 ### Is the FP16 baseline competent? Yes — and that is the bad news
 
 Recomputing achieved weight-streaming bandwidth from the committed log
-(RTX 3060 Laptop, 192-bit @ 12 Gbps ⇒ ~288 GB/s peak):
+(RTX 3060 Laptop, 192-bit @ 14 Gbps ⇒ 336 GB/s peak):
 
 | shape (M,K,N) | fp16 GB/s | W8 GB/s | W4 GB/s | W8 speedup / ideal | W4 speedup / ideal | W4 bandwidth eff. |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -236,7 +236,9 @@ Recomputing achieved weight-streaming bandwidth from the committed log
 | (4, 4096, 4096) | 255.8 | 204.6 | 95.1 | 1.60× / 2.0× | 1.49× / 4.0× | 37.2% |
 | (16, 4096, 4096) | 250.4 | 190.4 | 64.9 | 1.52× / 2.0× | 1.04× / 4.0× | 25.9% |
 
-**The FP16 baseline reaches 267.5 GB/s = 93% of theoretical peak.** It is not a
+**The FP16 baseline reaches 267.5 GB/s = 80% of theoretical peak** (and 285-300
+GB/s = 85-89% when re-measured under WSL2, where it isn't competing with the
+Windows desktop compositor). It is not a
 straw man — `F.linear` is doing its job. Good for honesty; it removes the
 "we beat an unoptimized baseline" escape hatch in both directions.
 
