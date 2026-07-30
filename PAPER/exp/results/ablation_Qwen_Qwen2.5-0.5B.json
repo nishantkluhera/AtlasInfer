@@ -1,0 +1,296 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B",
+  "eval_tokens": 30000,
+  "seed": 0,
+  "max_len": 1024,
+  "n_profiled_layers": 168,
+  "n_profiled_params": 357854208,
+  "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "torch": "2.5.1+cu121",
+  "rows": [
+    {
+      "arm": "fp16",
+      "target_bits": 16.0,
+      "ppl": 11.906399726867676,
+      "mb": 942.292724609375,
+      "seconds": 10.6
+    },
+    {
+      "arm": "uniform-int8",
+      "target_bits": 8.0,
+      "ppl": 11.911099433898926,
+      "mb": 620.911922454834,
+      "seconds": 12.1
+    },
+    {
+      "arm": "uniform-nf4",
+      "target_bits": 4.0,
+      "ppl": 12.679268836975098,
+      "mb": 484.05238914489746,
+      "seconds": 20.6
+    },
+    {
+      "arm": "knapsack-dp",
+      "target_bits": 4.25,
+      "ppl": 12.539234161376953,
+      "mb": 492.5841655731201,
+      "seconds": 19.9,
+      "counts": {
+        "int4": 134,
+        "int8": 34
+      },
+      "alloc_bytes": 190054080,
+      "predicted_error": 0.0883430540561676
+    },
+    {
+      "arm": "greedy-sensitivity",
+      "target_bits": 4.25,
+      "ppl": 12.598686218261719,
+      "mb": 493.3074378967285,
+      "seconds": 20.0,
+      "counts": {
+        "int4": 162,
+        "fp16": 2,
+        "int8": 4
+      },
+      "alloc_bytes": 190109504
+    },
+    {
+      "arm": "random-s0",
+      "target_bits": 4.25,
+      "ppl": 12.639765739440918,
+      "mb": 493.07809257507324,
+      "seconds": 20.1,
+      "counts": {
+        "int4": 162,
+        "int8": 4,
+        "fp16": 2
+      },
+      "random_seed": 0
+    },
+    {
+      "arm": "random-s1",
+      "target_bits": 4.25,
+      "ppl": 12.670965194702148,
+      "mb": 493.31625747680664,
+      "seconds": 20.2,
+      "counts": {
+        "int4": 164,
+        "fp16": 3,
+        "int8": 1
+      },
+      "random_seed": 1
+    },
+    {
+      "arm": "random-s2",
+      "target_bits": 4.25,
+      "ppl": 12.66492748260498,
+      "mb": 493.1989040374756,
+      "seconds": 20.0,
+      "counts": {
+        "int4": 158,
+        "int8": 4,
+        "fp16": 6
+      },
+      "random_seed": 2
+    },
+    {
+      "arm": "knapsack-dp",
+      "target_bits": 4.5,
+      "ppl": 12.42829418182373,
+      "mb": 502.8927764892578,
+      "seconds": 18.8,
+      "counts": {
+        "int8": 49,
+        "int4": 118,
+        "fp16": 1
+      },
+      "alloc_bytes": 203360320,
+      "predicted_error": 0.05753028392791748
+    },
+    {
+      "arm": "greedy-sensitivity",
+      "target_bits": 4.5,
+      "ppl": 12.593009948730469,
+      "mb": 503.11218070983887,
+      "seconds": 20.0,
+      "counts": {
+        "int4": 160,
+        "fp16": 6,
+        "int8": 2
+      },
+      "alloc_bytes": 201291904
+    },
+    {
+      "arm": "random-s0",
+      "target_bits": 4.5,
+      "ppl": 12.633655548095703,
+      "mb": 502.7920322418213,
+      "seconds": 20.1,
+      "counts": {
+        "int4": 160,
+        "int8": 2,
+        "fp16": 6
+      },
+      "random_seed": 0
+    },
+    {
+      "arm": "random-s1",
+      "target_bits": 4.5,
+      "ppl": 12.648921966552734,
+      "mb": 503.1509590148926,
+      "seconds": 19.1,
+      "counts": {
+        "int4": 160,
+        "fp16": 6,
+        "int8": 2
+      },
+      "random_seed": 1
+    },
+    {
+      "arm": "random-s2",
+      "target_bits": 4.5,
+      "ppl": 12.643644332885742,
+      "mb": 502.5057067871094,
+      "seconds": 17.2,
+      "counts": {
+        "int4": 155,
+        "int8": 3,
+        "fp16": 10
+      },
+      "random_seed": 2
+    },
+    {
+      "arm": "knapsack-dp",
+      "target_bits": 5.0,
+      "ppl": 12.365958213806152,
+      "mb": 518.6266098022461,
+      "seconds": 15.5,
+      "counts": {
+        "int8": 55,
+        "int4": 104,
+        "fp16": 9
+      },
+      "alloc_bytes": 223776768,
+      "predicted_error": 0.03204604983329773
+    },
+    {
+      "arm": "greedy-sensitivity",
+      "target_bits": 5.0,
+      "ppl": 12.502325057983398,
+      "mb": 522.0383796691895,
+      "seconds": 16.9,
+      "counts": {
+        "int4": 152,
+        "fp16": 12,
+        "int8": 4
+      },
+      "alloc_bytes": 223656704
+    },
+    {
+      "arm": "random-s0",
+      "target_bits": 5.0,
+      "ppl": 12.593009948730469,
+      "mb": 521.6061210632324,
+      "seconds": 17.0,
+      "counts": {
+        "int4": 154,
+        "int8": 4,
+        "fp16": 10
+      },
+      "random_seed": 0
+    },
+    {
+      "arm": "random-s1",
+      "target_bits": 5.0,
+      "ppl": 12.613653182983398,
+      "mb": 522.2540111541748,
+      "seconds": 16.9,
+      "counts": {
+        "int4": 153,
+        "fp16": 13,
+        "int8": 2
+      },
+      "random_seed": 1
+    },
+    {
+      "arm": "random-s2",
+      "target_bits": 5.0,
+      "ppl": 12.635685920715332,
+      "mb": 521.7615375518799,
+      "seconds": 16.8,
+      "counts": {
+        "int8": 4,
+        "int4": 147,
+        "fp16": 17
+      },
+      "random_seed": 2
+    },
+    {
+      "arm": "knapsack-dp",
+      "target_bits": 6.0,
+      "ppl": 12.266824722290039,
+      "mb": 553.8176860809326,
+      "seconds": 14.6,
+      "counts": {
+        "int8": 63,
+        "int4": 85,
+        "fp16": 20
+      },
+      "alloc_bytes": 267763584,
+      "predicted_error": 0.010064184665679932
+    },
+    {
+      "arm": "greedy-sensitivity",
+      "target_bits": 6.0,
+      "ppl": 12.445833206176758,
+      "mb": 560.386381149292,
+      "seconds": 16.3,
+      "counts": {
+        "int4": 140,
+        "fp16": 26,
+        "int8": 2
+      },
+      "alloc_bytes": 268386304
+    },
+    {
+      "arm": "random-s0",
+      "target_bits": 6.0,
+      "ppl": 12.498517036437988,
+      "mb": 559.725757598877,
+      "seconds": 16.2,
+      "counts": {
+        "int4": 138,
+        "fp16": 26,
+        "int8": 4
+      },
+      "random_seed": 0
+    },
+    {
+      "arm": "random-s1",
+      "target_bits": 6.0,
+      "ppl": 12.524202346801758,
+      "mb": 560.3204822540283,
+      "seconds": 16.5,
+      "counts": {
+        "int4": 141,
+        "fp16": 25,
+        "int8": 2
+      },
+      "random_seed": 1
+    },
+    {
+      "arm": "random-s2",
+      "target_bits": 6.0,
+      "ppl": 12.581941604614258,
+      "mb": 560.1954765319824,
+      "seconds": 16.4,
+      "counts": {
+        "fp16": 27,
+        "int4": 139,
+        "int8": 2
+      },
+      "random_seed": 2
+    }
+  ]
+}
