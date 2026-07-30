@@ -47,8 +47,11 @@ def _failed_profile_errors(precisions: tuple) -> Dict[str, float]:
         for p in precisions
     }
 
-# Linear layers we never quantize (numerically delicate / tiny relative to model).
-DEFAULT_EXCLUDE = ("embed", "lm_head", "norm", "ln_", "layernorm")
+# Layers we never quantize. Imported from the shared target-selection module so
+# the profiler and the patcher can never disagree about which layers exist — a
+# divergence there makes the allocator's output silently unusable (see
+# _targets.check_allocation_covers).
+from ._targets import DEFAULT_EXCLUDE  # noqa: E402  (re-exported for callers)
 
 # Generic English calibration text used when the caller supplies none.
 _FALLBACK_CALIBRATION = [
@@ -71,13 +74,6 @@ _FALLBACK_CALIBRATION = [
 ]
 
 
-def _is_linear_layer(module: nn.Module) -> bool:
-    """True for nn.Linear and HuggingFace Conv1D (GPT-2 style) layers."""
-    if isinstance(module, nn.Linear):
-        return True
-    return type(module).__name__ == "Conv1D"
-
-
 def _linear_in_features(module: nn.Module) -> Optional[int]:
     """Best-effort input feature count for a linear-like layer."""
     if hasattr(module, "in_features"):
@@ -89,11 +85,7 @@ def _linear_in_features(module: nn.Module) -> Optional[int]:
     return None
 
 
-def _param_count(module: nn.Module) -> int:
-    n = module.weight.numel()
-    if getattr(module, "bias", None) is not None:
-        n += module.bias.numel()
-    return n
+from ._targets import param_count as _param_count  # noqa: E402
 
 
 @dataclass
@@ -151,14 +143,10 @@ class SensitivityProfiler:
         self.quant_4bit = quant_4bit
 
     def _target_layers(self, model: nn.Module) -> Dict[str, nn.Module]:
-        targets = {}
-        for name, module in model.named_modules():
-            if not _is_linear_layer(module):
-                continue
-            if any(pat in name.lower() for pat in self.exclude_patterns):
-                continue
-            targets[name] = module
-        return targets
+        # Shared with the patcher so the profiled layer set and the quantized
+        # layer set are the same set by construction, not by coincidence.
+        from ._targets import target_modules
+        return target_modules(model, self.exclude_patterns)
 
     def _capture_activations(
         self,

@@ -14,23 +14,14 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 
+from ._targets import (
+    DEFAULT_EXCLUDE,
+    check_allocation_covers,
+    collect_targets as _collect_targets,
+    dense_bytes as _dense_bytes,
+    is_linear_layer as _is_linear_layer,
+)
 from .linear import QuantizedLinear, QuantizedLinear4bit, create_quantized_linear
-
-DEFAULT_EXCLUDE = ["embed", "lm_head", "norm", "ln_", "layernorm"]
-
-
-def _is_linear_layer(module: nn.Module) -> bool:
-    """True for nn.Linear and HuggingFace Conv1D layers."""
-    if isinstance(module, nn.Linear):
-        return True
-    return type(module).__name__ == "Conv1D"
-
-
-def _dense_bytes(module: nn.Module) -> int:
-    n = module.weight.numel()
-    if getattr(module, "bias", None) is not None:
-        n += module.bias.numel()
-    return n * module.weight.element_size()
 
 
 def _quantized_bytes(layer: nn.Module, fallback: int) -> int:
@@ -42,25 +33,6 @@ def _quantized_bytes(layer: nn.Module, fallback: int) -> int:
     if hasattr(layer, "memory_bytes"):  # W8A16Linear (kernel path)
         return layer.memory_bytes()
     return fallback  # fp16: kept dense
-
-
-def _collect_targets(
-    model: nn.Module, exclude_patterns: List[str]
-) -> List[tuple]:
-    """Return (parent, attr_name, module, full_name) for each quantizable layer."""
-    targets = []
-    for name, module in model.named_modules():
-        if not _is_linear_layer(module):
-            continue
-        if any(pat.lower() in name.lower() for pat in exclude_patterns):
-            continue
-        parts = name.rsplit(".", 1)
-        if len(parts) == 1:
-            parent, attr = model, parts[0]
-        else:
-            parent, attr = model.get_submodule(parts[0]), parts[1]
-        targets.append((parent, attr, module, name))
-    return targets
 
 
 def quantize_model(
@@ -111,6 +83,12 @@ def quantize_model_mixed(
     allocation = allocation or {}
 
     targets = _collect_targets(model, exclude_patterns)
+    # An allocation key that matches no layer is silently discarded below, and a
+    # layer absent from the allocation silently takes `default_precision`. Both
+    # produce a model that looks fine and is not the one the allocator designed,
+    # so say so loudly. Warn-only: a partial allocation is a legitimate input.
+    check_allocation_covers(allocation, [t[3] for t in targets],
+                            context="quantize_model_mixed")
     stats = {"fp16": 0, "int8": 0, "int4": 0}
     original_size = 0
     quantized_size = 0

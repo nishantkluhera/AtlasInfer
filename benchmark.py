@@ -72,14 +72,18 @@ def model_weight_bytes(model: torch.nn.Module) -> int:
     return total
 
 
-def linear_param_count(model: torch.nn.Module, exclude=("embed", "lm_head", "norm", "ln_")) -> int:
-    """Total parameters in the quantizable linear layers (drives the budget)."""
+def linear_param_count(model: torch.nn.Module, exclude=None) -> int:
+    """Total parameters in the quantizable linear layers (drives the budget).
+
+    Exclusion defaults to the shared list rather than a local copy: this function
+    previously carried its own four-entry tuple that was missing "layernorm" and
+    only worked because "norm" is a substring of it.
+    """
+    from atlasinfer._targets import DEFAULT_EXCLUDE, is_excluded
     from atlasinfer.allocator import get_layer_sizes
+    patterns = DEFAULT_EXCLUDE if exclude is None else exclude
     sizes = get_layer_sizes(model)
-    return sum(
-        n for name, n in sizes.items()
-        if not any(p in name.lower() for p in exclude)
-    )
+    return sum(n for name, n in sizes.items() if not is_excluded(name, patterns))
 
 
 # --------------------------------------------------------------------------- #
