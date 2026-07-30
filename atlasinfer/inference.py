@@ -18,13 +18,13 @@ from .allocator import allocate_optimal, print_allocation_report
 class AtlasInference:
     """
     High-level API for efficient LLM inference with quantization and offloading.
-    
+
     Example:
         >>> engine = AtlasInference("facebook/opt-1.3b")
         >>> output = engine.generate("The meaning of life is", max_tokens=50)
         >>> print(output)
     """
-    
+
     def __init__(
         self,
         model_name: str,
@@ -74,18 +74,18 @@ class AtlasInference:
         self._log(f"Device: {self.device}")
         if self.use_kernel:
             self._log("Fused Triton kernels: ENABLED for INT8/INT4 layers")
-        
+
         # Load tokenizer
         self._log("Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
+
         # Handle missing pad token
         if self.tokenizer.pad_token_id is None:
             if self.tokenizer.eos_token_id is not None:
                 self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
             else:
                 self.tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        
+
         # Load model to CPU first
         self._log("Loading model weights to CPU...")
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -94,7 +94,7 @@ class AtlasInference:
             low_cpu_mem_usage=True
         )
         self._cleanup_memory()
-        
+
         # Apply quantization
         if quantize:
             if memory_budget_gb is not None:
@@ -108,7 +108,7 @@ class AtlasInference:
                 quantize_model(self.model, precision="int8", verbose=verbose,
                                use_kernel=self.use_kernel)
             self._cleanup_memory()
-        
+
         # Setup CPU offload or move to GPU
         self.offloaded = False
         if cpu_offload and self.device.type == 'cuda':
@@ -120,14 +120,14 @@ class AtlasInference:
             self._log(f"Moving model to {self.device}...")
             self.model.to(self.device)
             self._cleanup_memory()
-        
+
         self.model.eval()
         self._log("Model ready!")
-        
+
         if verbose:
             mem_info = estimate_model_memory(self.model)
             self._log(f"Model memory: {mem_info['total_gb']:.2f} GB")
-    
+
     def generate(
         self,
         prompt: str,
@@ -140,7 +140,7 @@ class AtlasInference:
     ) -> str:
         """
         Generate text from a prompt.
-        
+
         Args:
             prompt: Input text prompt
             max_tokens: Maximum number of tokens to generate
@@ -149,13 +149,13 @@ class AtlasInference:
             top_p: Top-P (nucleus) sampling parameter
             do_sample: Whether to use sampling (vs greedy decoding)
             **kwargs: Additional generate() arguments
-            
+
         Returns:
             Generated text (including prompt)
         """
         # Tokenize
         inputs = self.tokenizer(prompt, return_tensors="pt")
-        
+
         # In offload mode the model lives on CPU (blocks stream to the GPU during
         # the forward pass), so inputs must start on CPU.
         input_device = torch.device('cpu') if self.offloaded else self.device
@@ -181,27 +181,27 @@ class AtlasInference:
             'eos_token_id': self.tokenizer.eos_token_id,
             'do_sample': do_sample,
         }
-        
+
         if do_sample:
             generate_kwargs.update({
                 'temperature': temperature,
                 'top_k': top_k,
                 'top_p': top_p,
             })
-        
+
         generate_kwargs.update(kwargs)
-        
+
         with torch.no_grad():
             output_ids = self.model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 **generate_kwargs
             )
-        
+
         # Decode
         output_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         return output_text
-    
+
     def _apply_mixed_precision(self, memory_budget_gb: float, verbose: bool) -> None:
         """Profile -> allocate -> quantize at mixed precision within a budget.
 
@@ -241,12 +241,12 @@ class AtlasInference:
             verbose=verbose,
             use_kernel=self.use_kernel,
         )
-    
+
     def _log(self, message: str) -> None:
         """Print message if verbose mode is enabled."""
         if self.verbose:
             print(f"[AtlasInfer] {message}")
-    
+
     def _cleanup_memory(self) -> None:
         """Force garbage collection and CUDA cache flush."""
         gc.collect()
@@ -254,8 +254,14 @@ class AtlasInference:
             torch.cuda.empty_cache()
 
 
-def parse_args():
-    """Parse command line arguments."""
+def parse_args(argv=None):
+    """Parse command line arguments.
+
+    Args:
+        argv: argument list to parse. ``None`` reads ``sys.argv`` as usual; pass
+            an explicit list to parse without touching global state (which is
+            what makes the CLI testable).
+    """
     parser = argparse.ArgumentParser(
         description="AtlasInfer - Efficient LLM Inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -263,15 +269,15 @@ def parse_args():
 Examples:
   # Basic inference with quantization
   python -m atlasinfer.inference --model facebook/opt-1.3b --prompt "Hello, world!"
-  
+
   # Force CPU offloading for larger models
   python -m atlasinfer.inference --model mistralai/Mistral-7B-v0.1 --prompt "The future of AI" --cpu-offload
-  
+
   # Run without quantization (baseline)
   python -m atlasinfer.inference --model facebook/opt-125m --prompt "Test" --no-quantize
         """
     )
-    
+
     # Model arguments
     parser.add_argument(
         '--model', '-m',
@@ -285,7 +291,7 @@ Examples:
         default="The meaning of life is",
         help='Input prompt for generation'
     )
-    
+
     # Generation arguments
     parser.add_argument(
         '--max-tokens',
@@ -310,7 +316,7 @@ Examples:
         action='store_true',
         help='Use sampling instead of greedy decoding'
     )
-    
+
     # AtlasInfer arguments
     parser.add_argument(
         '--no-quantize',
@@ -358,17 +364,17 @@ Examples:
         help='Suppress progress output'
     )
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main():
     """CLI entry point."""
     args = parse_args()
-    
+
     print("=" * 60)
     print("AtlasInfer - Efficient LLM Inference")
     print("=" * 60)
-    
+
     try:
         # Initialize engine
         engine = AtlasInference(
@@ -382,12 +388,12 @@ def main():
             kernel=args.kernel,
             verbose=not args.quiet
         )
-        
+
         # Generate
         print("\n" + "-" * 60)
         print(f"Prompt: {args.prompt}")
         print("-" * 60)
-        
+
         start_time = time.time()
         output = engine.generate(
             prompt=args.prompt,
@@ -397,19 +403,19 @@ def main():
             do_sample=args.do_sample
         )
         elapsed = time.time() - start_time
-        
+
         print(f"\nGenerated Output:\n{output}")
         print("-" * 60)
-        
+
         # Stats
         prompt_tokens = len(engine.tokenizer.encode(args.prompt))
         output_tokens = len(engine.tokenizer.encode(output))
         generated_tokens = output_tokens - prompt_tokens
         tokens_per_sec = generated_tokens / elapsed if elapsed > 0 else 0
-        
+
         print(f"Time: {elapsed:.2f}s | Generated: {generated_tokens} tokens | Speed: {tokens_per_sec:.1f} tok/s")
         print("=" * 60)
-        
+
     except Exception as e:
         print(f"\nError: {e}")
         import traceback

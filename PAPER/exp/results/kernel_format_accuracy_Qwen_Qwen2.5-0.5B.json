@@ -1,0 +1,51 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B",
+  "eval_tokens": 30000,
+  "seed": 0,
+  "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "torch": "2.5.1+cu121",
+  "has_triton": false,
+  "note": "Accuracy of the two quantization FORMATS. The kernel rows use the eager dequant fallback, which is numerically identical to the fused Triton kernel (tests/test_triton_kernels.py asserts 3e-4 agreement), so these numbers are valid without Triton.",
+  "rows": [
+    {
+      "config": "fp16",
+      "format": "dense",
+      "nominal_bits": 16,
+      "ppl": 11.906399726867676,
+      "mb": 942.29296875,
+      "delta_vs_fp16": 0.0
+    },
+    {
+      "config": "eager int8 (block+outlier)",
+      "format": "eager",
+      "nominal_bits": 8,
+      "ppl": 11.911099433898926,
+      "mb": 620.912166595459,
+      "delta_vs_fp16": 0.00469970703125
+    },
+    {
+      "config": "eager nf4 (block+outlier)",
+      "format": "eager",
+      "nominal_bits": 4,
+      "ppl": 12.679268836975098,
+      "mb": 484.05263328552246,
+      "delta_vs_fp16": 0.7728691101074219
+    },
+    {
+      "config": "kernel W8A16 (per-channel)",
+      "format": "kernel",
+      "nominal_bits": 8,
+      "ppl": 11.924931526184082,
+      "mb": 601.623046875,
+      "delta_vs_fp16": 0.01853179931640625
+    },
+    {
+      "config": "kernel W4A16 (per-channel)",
+      "format": "kernel",
+      "nominal_bits": 4,
+      "ppl": 26.295459747314453,
+      "mb": 430.998046875,
+      "delta_vs_fp16": 14.389060020446777
+    }
+  ]
+}

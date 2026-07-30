@@ -43,10 +43,16 @@ if torch.cuda.is_available():
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 from transformers.utils import logging as hf_logging  # noqa: E402
 
-from atlasinfer.linear import QuantizedLinear, QuantizedLinear4bit  # noqa: E402
 from atlasinfer.patcher import quantize_model, quantize_model_mixed  # noqa: E402
 from atlasinfer.sensitivity import SensitivityProfiler  # noqa: E402
 from atlasinfer.allocator import allocate_optimal  # noqa: E402
+# Re-exported so `from benchmark import evaluate_perplexity, ...` keeps working.
+# New code should import from atlasinfer.evaluation directly -- importing this
+# module runs CLI-oriented side effects (HF env vars, a CUDA warmup allocation).
+from atlasinfer.evaluation import (  # noqa: E402,F401
+    evaluate_perplexity, load_wikitext, model_weight_bytes,
+    quantized_bits_per_weight, resident_bytes,
+)
 
 hf_logging.set_verbosity_error()
 
@@ -54,24 +60,6 @@ hf_logging.set_verbosity_error()
 # --------------------------------------------------------------------------- #
 # Memory accounting
 # --------------------------------------------------------------------------- #
-def model_weight_bytes(model: torch.nn.Module) -> int:
-    """Resident weight footprint: quantized buffers + remaining dense params."""
-    total = sum(p.numel() * p.element_size() for p in model.parameters())
-    for module in model.modules():
-        if isinstance(module, (QuantizedLinear, QuantizedLinear4bit)):
-            total += module.quantized_weights.memory_bytes()
-            if module.bias is not None:
-                total += module.bias.numel() * module.bias.element_size()
-            # AWQ's per-input-channel scale is a buffer, so it is in neither
-            # model.parameters() nor quantized_weights.memory_bytes(). Without
-            # this an AWQ model under-reports, and disagrees with
-            # compare_baselines.resident_bytes() (params + ALL buffers).
-            in_scale = getattr(module, "in_scale", None)
-            if in_scale is not None:
-                total += in_scale.numel() * in_scale.element_size()
-    return total
-
-
 def linear_param_count(model: torch.nn.Module, exclude=None) -> int:
     """Total parameters in the quantizable linear layers (drives the budget).
 
@@ -84,72 +72,6 @@ def linear_param_count(model: torch.nn.Module, exclude=None) -> int:
     patterns = DEFAULT_EXCLUDE if exclude is None else exclude
     sizes = get_layer_sizes(model)
     return sum(n for name, n in sizes.items() if not is_excluded(name, patterns))
-
-
-# --------------------------------------------------------------------------- #
-# Perplexity (standard sliding-window negative log-likelihood)
-# --------------------------------------------------------------------------- #
-@torch.no_grad()
-def evaluate_perplexity(
-    model, tokenizer, text: str, device, max_len: int = 1024, stride: int = 512,
-    max_tokens: Optional[int] = None,
-) -> float:
-    enc = tokenizer(text, return_tensors="pt")
-    input_ids = enc.input_ids
-    if max_tokens is not None:
-        input_ids = input_ids[:, :max_tokens]
-    input_ids = input_ids.to(device)
-    seq_len = input_ids.size(1)
-
-    nlls: List[torch.Tensor] = []
-    n_tokens = 0
-    prev_end = 0
-    for begin in range(0, seq_len, stride):
-        end = min(begin + max_len, seq_len)
-        trg_len = end - prev_end
-        ids = input_ids[:, begin:end]
-        target = ids.clone()
-        target[:, :-trg_len] = -100  # only score the new tokens in this window
-        out = model(ids, labels=target)
-        # out.loss is the mean NLL over (trg_len - 1) scored positions.
-        nlls.append(out.loss.float() * trg_len)
-        n_tokens += trg_len
-        prev_end = end
-        if end == seq_len:
-            break
-    return float(torch.exp(torch.stack(nlls).sum() / n_tokens))
-
-
-# --------------------------------------------------------------------------- #
-# Data
-# --------------------------------------------------------------------------- #
-def load_wikitext():
-    """Return (calibration_texts, eval_text) from WikiText-2.
-
-    The dataset id is tried both bare and namespaced: newer huggingface_hub /
-    datasets reject the legacy bare ``"wikitext"`` id (it must be
-    ``namespace/name``), while older stacks only know the bare id. Same content
-    either way, so numbers stay comparable across environments.
-    """
-    from datasets import load_dataset
-
-    def _load(split):
-        last = None
-        for repo in ("wikitext", "Salesforce/wikitext"):
-            try:
-                return load_dataset(repo, "wikitext-2-raw-v1", split=split)
-            except Exception as exc:  # noqa: BLE001 - id/URI schemes differ by version
-                last = exc
-        raise last
-
-    test = _load("test")
-    eval_text = "\n\n".join(t for t in test["text"] if t.strip())
-
-    train = _load("train")
-    # Plenty of calibration docs: the sensitivity profiler caps at its own
-    # max_samples (8), while GPTQ consumes many more for a well-conditioned Hessian.
-    calib = [t for t in train["text"] if len(t.strip()) > 200][:256]
-    return calib, eval_text
 
 
 # --------------------------------------------------------------------------- #

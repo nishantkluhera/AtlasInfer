@@ -45,7 +45,16 @@ kernel = ["triton>=3.0,<4"]  # fused W8A16 kernel; Linux/WSL2 only
 # whatever torch/transformers the cloud image ships, and compare_baselines.py
 # already degrades gracefully to a SKIP when one fails to import. Pinning them
 # would turn a skipped row into a failed install of the whole extra.
-baselines = ["bitsandbytes", "optimum", "gptqmodel", "autoawq"]
+#
+# NOTE: `autoawq` is DEPRECATED by its maintainers and was last tested against
+# transformers 4.51, so it will usually fail to import on a current stack. It is
+# excluded from `baselines` for that reason — an extra that predictably fails is
+# worse than one that is honest about what it installs. AtlasInfer's own from-
+# scratch AWQ (`atlasinfer/awq.py`, the `awq-nf4` arm) covers the same mechanism
+# and is what the results use. Install the external reference explicitly if you
+# want it, accepting that it needs an older transformers:
+#     pip install -e ".[baselines]" autoawq
+baselines = ["bitsandbytes", "optimum", "gptqmodel"]
 # Downstream zero-shot accuracy (eval_downstream.py).
 eval = ["lm-eval>=0.4.0,<0.6"]
 

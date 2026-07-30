@@ -52,7 +52,7 @@ from atlasinfer.linear import QuantizedLinear, QuantizedLinear4bit
 from atlasinfer.quantizer import (
     dequantize_tensor, dequantize_tensor_nf4, dequantize_tensor_fp4,
 )
-from benchmark import load_wikitext, model_weight_bytes
+from atlasinfer.evaluation import load_wikitext, model_weight_bytes
 
 hf_logging.set_verbosity_error()
 

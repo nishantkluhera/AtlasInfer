@@ -535,6 +535,29 @@ The earlier 8.6–33.2% "DP beats greedy" margins in §2d were **entirely an
 artifact of the straw-man baseline** and should be disregarded. K5's kill
 condition ("fails to beat greedy by more than run-to-run noise") is met.
 
+### K6 — CONFIRMED WORSE. The 4-bit kernel format is not deployable.
+
+The kernel/eager format gap flagged in §2c has now been measured
+(`PAPER/exp/kernel_format_accuracy.py`, Qwen2.5-0.5B, 30k tokens):
+
+| Config | format | ~bits | MB | Perplexity | Δ vs FP16 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| fp16 | dense | 16 | 942.3 | 11.9064 | +0.0000 |
+| eager int8 (block+outlier) | eager | 8 | 620.9 | 11.9111 | +0.0047 |
+| kernel W8A16 (per-channel) | kernel | 8 | 601.6 | 11.9249 | **+0.0185** |
+| eager nf4 (block+outlier) | eager | 4 | 484.1 | 12.6793 | +0.7729 |
+| kernel W4A16 (per-channel) | kernel | 4 | 431.0 | 26.2955 | **+14.3891** |
+
+W8A16 is essentially lossless, so the INT8 kernel's 1.95×-of-an-ideal-2.0× is a
+real result. But **W4A16 more than doubles perplexity** — per-channel symmetric
+int4 with no blocks, no outliers and no codebook is not a format anyone would
+deploy. Its 1.78–2.74× batch-1 speedup is a speedup of an unusable configuration.
+
+That is the answer to the reviewer question §2c said had none ("what is the
+perplexity of the thing you benchmarked for speed?"), and the answer is bad. K6
+was already a FAIL on competitiveness grounds; it is now also a FAIL on the more
+basic ground that half the speed claim describes a broken model.
+
 ### Effect on the verdict: **unchanged — still Option 3.**
 
 The pre-registered rule is "K1 fails **and** (K3 or K5) fails → Option 3." K5 now

@@ -45,7 +45,7 @@ from atlasinfer import seed_everything  # noqa: E402
 from atlasinfer.allocator import BYTES_PER_PARAM, allocate_greedy, allocate_optimal  # noqa: E402
 from atlasinfer.patcher import quantize_model, quantize_model_mixed  # noqa: E402
 from atlasinfer.sensitivity import SensitivityProfiler  # noqa: E402
-from benchmark import evaluate_perplexity, load_wikitext, model_weight_bytes  # noqa: E402
+from atlasinfer.evaluation import evaluate_perplexity, load_wikitext, model_weight_bytes  # noqa: E402
 
 hf_logging.set_verbosity_error()
 

@@ -53,16 +53,9 @@ from atlasinfer.sensitivity import SensitivityProfiler
 from atlasinfer.allocator import allocate_greedy, allocate_optimal
 from atlasinfer.gptq import quantize_model_gptq
 from atlasinfer.awq import quantize_model_awq
-from benchmark import evaluate_perplexity, load_wikitext
+from atlasinfer.evaluation import evaluate_perplexity, load_wikitext, resident_bytes
 
 hf_logging.set_verbosity_error()
-
-
-def resident_bytes(model) -> int:
-    """Total bytes of all params + buffers resident on the model (any method)."""
-    total = sum(p.numel() * p.element_size() for p in model.parameters())
-    total += sum(b.numel() * b.element_size() for b in model.buffers())
-    return total
 
 
 def gptq_baseline(model_name, tokenizer, calib, device_map):
@@ -101,6 +94,150 @@ def awq_baseline(model_name, tokenizer):
     return m.model.to("cuda")
 
 
+class Ctx:
+    """Model/tokenizer plumbing plus memoized profiling for the method builders.
+
+    Profiling is the single most expensive step and three arms need it, so it is
+    computed at most once and only if one of those arms actually runs -- with
+    ``--only bnb-nf4`` it is never computed at all.
+    """
+
+    def __init__(self, args, tok, calib, dev, dmap, bnb_map):
+        self.args, self.tok, self.calib = args, tok, calib
+        self.dev, self.dmap, self.bnb_map = dev, dmap, bnb_map
+        self._cache = {}
+
+    def fp16(self):
+        return AutoModelForCausalLM.from_pretrained(
+            self.args.model, dtype=torch.float16, device_map=self.dmap)
+
+    def place(self, model):
+        """Put on GPU for in-place work (no-op if already device-mapped)."""
+        return model if self.args.device_map else model.to(self.dev)
+
+    def profiles(self):
+        if "profiles" not in self._cache:
+            base = self.place(self.fp16()).eval()
+            prof = SensitivityProfiler(max_samples=self.args.calib_samples,
+                                       seq_len=self.args.calib_seqlen)
+            self._cache["profiles"] = prof.profile_end_to_end(
+                base, tokenizer=self.tok,
+                calibration_texts=self.calib[self.args.calib_offset:])
+            if not self.args.device_map:
+                base.to("cpu")
+            del base
+            gc.collect()
+            torch.cuda.empty_cache()
+        return self._cache["profiles"]
+
+    def budget(self):
+        p = self.profiles()
+        return int(sum(x.param_count for x in p.values()) * self.args.mixed_bits / 8)
+
+    def knapsack(self):
+        if "knapsack" not in self._cache:
+            self._cache["knapsack"] = allocate_optimal(
+                self.profiles(), budget_bytes=self.budget())
+        return self._cache["knapsack"]
+
+    def greedy(self):
+        if "greedy" not in self._cache:
+            p = self.profiles()
+            self._cache["greedy"] = allocate_greedy(
+                {n: x.sensitivity("int4") for n, x in p.items()},
+                {n: x.param_count for n, x in p.items()},
+                self.budget(), profiles=p)
+        return self._cache["greedy"]
+
+    def gptq(self, double_quant=False, allocation=None):
+        gm = self.place(self.fp16()).eval()
+        quantize_model_gptq(gm, tokenizer=self.tok, calibration_texts=self.calib,
+                            double_quant=double_quant, allocation=allocation,
+                            verbose=False)
+        return gm
+
+    def awq(self):
+        am = self.place(self.fp16()).eval()
+        quantize_model_awq(am, tokenizer=self.tok, calibration_texts=self.calib,
+                           verbose=False)
+        return am
+
+
+def build_methods(ctx) -> list:
+    """The method registry: ``(key, label, builder, bits)`` per measured arm.
+
+    Kept out of ``main()`` so the set of methods can be inspected and unit-tested
+    without running a single forward pass. ``bits`` may be a zero-arg callable
+    when it depends on an allocation that only exists after the builder runs.
+    """
+    a = ctx.args
+    mb = a.mixed_bits
+    methods = [
+        ("fp16", "fp16", ctx.fp16, 16),
+        ("int8", "AtlasInfer int8",
+         lambda: quantize_model(ctx.fp16(), precision="int8", verbose=False), 8),
+        ("int4-sym", "AtlasInfer int4 (sym)",
+         lambda: quantize_model(ctx.fp16(), precision="int4", quant_4bit="int4",
+                                verbose=False), 4),
+        ("nf4", "AtlasInfer nf4",
+         lambda: quantize_model(ctx.fp16(), precision="int4", quant_4bit="nf4",
+                                verbose=False), 4),
+    ]
+    if a.double_quant:
+        methods.append(
+            ("nf4-dq", "AtlasInfer nf4+dq",
+             lambda: quantize_model(ctx.fp16(), precision="int4", quant_4bit="nf4",
+                                    double_quant=True, verbose=False), 4))
+    methods.append(("gptq-nf4", "AtlasInfer gptq-nf4", ctx.gptq, 4))
+    if a.double_quant:
+        methods.append(("gptq-nf4-dq", "AtlasInfer gptq-nf4+dq",
+                        lambda: ctx.gptq(double_quant=True), 4))
+    methods += [
+        ("awq-nf4", "AtlasInfer awq-nf4", ctx.awq, 4),
+        # Sensitivity-allocated per-layer precision, and its ablation.
+        ("mixed", f"AtlasInfer mixed-{mb:g}bit",
+         lambda: quantize_model_mixed(ctx.fp16(),
+                                      allocation=ctx.knapsack().allocations,
+                                      verbose=False),
+         lambda: round(ctx.knapsack().avg_bits, 1)),
+        # Same budget, benefit-per-byte greedy instead of the exact DP. Reuses the
+        # one profiling pass, so it is nearly free -- and it is what shows whether
+        # the knapsack solve is doing any work (per PAPER/01_go_nogo.md 2f: it
+        # isn't; the two land within noise of each other).
+        ("greedy", f"AtlasInfer greedy-{mb:g}bit",
+         lambda: quantize_model_mixed(ctx.fp16(),
+                                      allocation=ctx.greedy().allocations,
+                                      verbose=False),
+         lambda: round(ctx.greedy().avg_bits, 1)),
+        # THE composition experiment: GPTQ error compensation applied *within* a
+        # mixed allocation. Orthogonal mechanisms -- the allocator picks each
+        # layer's width, GPTQ compensates the residual at that width -- so they
+        # should stack. Plain GPTQ-NF4 Pareto-dominates mixed precision on 3 of 4
+        # small models, so if this does not beat GPTQ alone the allocator adds
+        # nothing over a method that costs no extra memory. See K4.
+        ("gptq-mixed", f"AtlasInfer gptq-mixed-{mb:g}bit",
+         lambda: ctx.gptq(allocation=ctx.knapsack().allocations),
+         lambda: round(ctx.knapsack().avg_bits, 1)),
+        # bitsandbytes. Guarded like everything else: it is a native extension and
+        # the single most likely thing to fail on an unfamiliar cloud image.
+        ("bnb-int8", "bnb int8 (LLM.int8)",
+         lambda: AutoModelForCausalLM.from_pretrained(
+             a.model, quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+             device_map=ctx.bnb_map, dtype=torch.float16), 8),
+        ("bnb-nf4", "bnb nf4",
+         lambda: AutoModelForCausalLM.from_pretrained(
+             a.model, device_map=ctx.bnb_map, dtype=torch.float16,
+             quantization_config=BitsAndBytesConfig(
+                 load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                 bnb_4bit_compute_dtype=torch.float16)), 4),
+        # External SOTA-tier 4-bit references (optional, version-fragile).
+        ("gptq", "gptq (auto-gptq)",
+         lambda: gptq_baseline(a.model, ctx.tok, ctx.calib, a.device_map), 4),
+        ("awq", "awq (autoawq)", lambda: awq_baseline(a.model, ctx.tok), 4),
+    ]
+    return methods
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", "-m", default="EleutherAI/pythia-410m")
@@ -131,10 +268,18 @@ def main():
                          "scales (QLoRA-style), which closes most of the 4-bit memory "
                          "gap to bnb's NF4 at ~unchanged perplexity")
     ap.add_argument("--skip", nargs="*", default=[],
-                    help="method keys to skip, e.g. --skip awq gptq. Keys: gptq, awq "
-                         "(external baselines), gptq-nf4, awq-nf4, nf4-dq, gptq-nf4-dq "
-                         "(AtlasInfer). A prefix skips its variants, so `--skip awq` "
-                         "drops both the external AWQ and AtlasInfer's awq-nf4.")
+                    help="method keys to skip, e.g. --skip awq gptq. Keys: fp16, "
+                         "int8, int4-sym, nf4, gptq-nf4, awq-nf4, mixed, greedy, "
+                         "gptq-mixed, bnb-int8, bnb-nf4, gptq, awq (+ nf4-dq and "
+                         "gptq-nf4-dq under --double-quant). A prefix skips its "
+                         "variants, so `--skip awq` drops both the external AWQ "
+                         "and AtlasInfer's awq-nf4.")
+    ap.add_argument("--only", nargs="*", default=[],
+                    help="run ONLY these method keys (exact match). Use to re-run "
+                         "one arm cheaply after a failure instead of paying for the "
+                         "whole comparison again -- e.g. --only fp16 gptq-mixed. "
+                         "Note the JSON is rewritten with just these rows, so point "
+                         "--out somewhere else if you want to keep the full table.")
     args = ap.parse_args()
 
     from atlasinfer import seed_everything
@@ -206,142 +351,37 @@ def main():
             model.to("cpu")
         del model; gc.collect(); torch.cuda.empty_cache()
 
-    def fp16():
-        return AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16, device_map=DMAP)
-
-    def place(model):  # put on GPU for in-place work (no-op if already device-mapped)
-        return model if args.device_map else model.to(dev)
-
     def guarded(key, label, fn, bits=4):
         """Measure one method, but never let its failure discard the whole run.
 
-        The results table is only written at the very end, so an unguarded
-        exception here (an OOM quantizing a 7B+ model is the common one) throws
-        away every row already measured -- potentially hours of a cloud run. Skip
-        keys are matched loosely so `--skip awq` also skips `awq-nf4`.
+        An unguarded exception here (an OOM quantizing a 7B+ model is the common
+        one, and a missing native library the other) would abort before the later
+        methods run -- potentially hours of paid GPU for nothing. Skip keys are
+        matched loosely so `--skip awq` also skips `awq-nf4`.
+
+        ``bits`` may be a zero-arg callable when it depends on an allocation that
+        is only computed inside ``fn``; it is resolved after the build succeeds.
         """
         if any(k == key or key.startswith(k + "-") for k in args.skip):
             print(f"  {label:<22} SKIPPED (--skip)")
             return
         try:
-            record(label, fn(), bits)
+            model = fn()
+            record(label, model, bits() if callable(bits) else bits)
+        except ImportError as exc:
+            print(f"  {label:<22} SKIPPED (not installed: {exc}. "
+                  f"`pip install -e \".[baselines]\"`)")
         except Exception as exc:  # noqa: BLE001 - one method must not sink the run
             print(f"  {label:<22} FAILED ({type(exc).__name__}: {exc}) -- continuing")
             gc.collect(); torch.cuda.empty_cache()
 
     print(f"\nComparing on {args.model} (WikiText-2, {args.eval_tokens} eval tokens)\n")
 
-    # FP16 baseline.
-    record("fp16", fp16(), 16)
-
-    # AtlasInfer uniform (symmetric int4 vs NF4 to show the codebook's effect).
-    record("AtlasInfer int8", quantize_model(fp16(), precision="int8", verbose=False), 8)
-    record("AtlasInfer int4 (sym)",
-           quantize_model(fp16(), precision="int4", quant_4bit="int4", verbose=False), 4)
-    record("AtlasInfer nf4",
-           quantize_model(fp16(), precision="int4", quant_4bit="nf4", verbose=False), 4)
-    if args.double_quant:
-        guarded("nf4-dq", "AtlasInfer nf4+dq",
-                lambda: quantize_model(fp16(), precision="int4", quant_4bit="nf4",
-                                       double_quant=True, verbose=False))
-
-    # NF4 + GPTQ error compensation (needs the model on-device for the Hessian pass).
-    def _gptq(double_quant=False):
-        gm = place(fp16()).eval()
-        quantize_model_gptq(gm, tokenizer=tok, calibration_texts=calib,
-                            double_quant=double_quant, verbose=False)
-        return gm
-    guarded("gptq-nf4", "AtlasInfer gptq-nf4", _gptq)
-    if args.double_quant:
-        guarded("gptq-nf4-dq", "AtlasInfer gptq-nf4+dq", lambda: _gptq(double_quant=True))
-
-    # AWQ: activation-aware scaling — a Hessian-free route to the same 4-bit tier.
-    def _awq():
-        am = place(fp16()).eval()
-        quantize_model_awq(am, tokenizer=tok, calibration_texts=calib, verbose=False)
-        return am
-    guarded("awq-nf4", "AtlasInfer awq-nf4", _awq)
-
-    # AtlasInfer mixed (profile once, allocate at target bits).
-    base = place(fp16()).eval()
-    profiler = SensitivityProfiler(max_samples=args.calib_samples,
-                                   seq_len=args.calib_seqlen)
-    profiles = profiler.profile_end_to_end(
-        base, tokenizer=tok, calibration_texts=calib[args.calib_offset:])
-    if not args.device_map:
-        base.to("cpu")
-    del base; gc.collect(); torch.cuda.empty_cache()
-    n_params = sum(p.param_count for p in profiles.values())
-    budget = int(n_params * args.mixed_bits / 8)
-    alloc = allocate_optimal(profiles, budget_bytes=budget)
-    record(f"AtlasInfer mixed-{args.mixed_bits:g}bit",
-           quantize_model_mixed(fp16(), allocation=alloc.allocations, verbose=False),
-           round(alloc.avg_bits, 1))
-
-    # Allocator ablation at the SAME budget: is the knapsack doing the work, or
-    # would any sensible allocation do? greedy = benefit-per-byte (the MCKP
-    # LP-relaxation heuristic, provably within one item of optimal, so a genuinely
-    # strong baseline). Cheap -- reuses the one profiling pass.
-    sens = {n: p.sensitivity("int4") for n, p in profiles.items()}
-    sizes = {n: p.param_count for n, p in profiles.items()}
-    greedy = allocate_greedy(sens, sizes, budget, profiles=profiles)
-    guarded("greedy", f"AtlasInfer greedy-{args.mixed_bits:g}bit",
-            lambda: quantize_model_mixed(fp16(), allocation=greedy.allocations, verbose=False),
-            bits=round(greedy.avg_bits, 1))
-
-    # THE composition experiment: GPTQ error compensation applied *within* a mixed
-    # allocation. The two mechanisms are orthogonal -- the allocator picks each
-    # layer's bit-width, GPTQ compensates the residual error at that width -- so
-    # they should stack. This has never been run before (quantize_model_gptq had
-    # no allocation parameter until now), and it is the one open question left:
-    # plain GPTQ-NF4 Pareto-dominates mixed precision on 3 of 4 small models, so
-    # if the composition does not beat GPTQ alone, the allocator adds nothing on
-    # top of a method that costs no extra memory. See PAPER/01_go_nogo.md K4.
-    def _gptq_mixed():
-        gm = place(fp16()).eval()
-        quantize_model_gptq(gm, tokenizer=tok, calibration_texts=calib,
-                            allocation=alloc.allocations, verbose=False)
-        return gm
-    guarded("gptq-mixed", f"AtlasInfer gptq-mixed-{args.mixed_bits:g}bit",
-            _gptq_mixed, bits=round(alloc.avg_bits, 1))
-
-    # bitsandbytes int8 (LLM.int8()) and nf4. GUARDED: bitsandbytes is a native
-    # extension and is the single most likely thing to fail on an unfamiliar
-    # cloud image (CUDA version mismatch, missing libcudart, unsupported compute
-    # capability). Unguarded, such a failure would throw away every AtlasInfer
-    # row already measured -- and on a 7B run those rows are hours of paid GPU.
-    guarded("bnb-int8", "bnb int8 (LLM.int8)",
-            lambda: AutoModelForCausalLM.from_pretrained(
-                args.model, quantization_config=BitsAndBytesConfig(load_in_8bit=True),
-                device_map=BNB_MAP, dtype=torch.float16), bits=8)
-
-    guarded("bnb-nf4", "bnb nf4",
-            lambda: AutoModelForCausalLM.from_pretrained(
-                args.model, device_map=BNB_MAP, dtype=torch.float16,
-                quantization_config=BitsAndBytesConfig(
-                    load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=torch.float16)), bits=4)
-
-    # External SOTA-tier 4-bit baselines (optional). Each is guarded: a missing
-    # library or a version/runtime failure prints a SKIPPED note and the rest of
-    # the comparison continues, so you always get whatever baselines are present.
-    def external(key, label, fn):
-        if key in args.skip:
-            print(f"  {label:<22} SKIPPED (--skip {key})")
-            return
-        try:
-            record(label, fn(), 4)
-        except ImportError as exc:
-            print(f"  {label:<22} SKIPPED (not installed: {exc}. "
-                  f"`pip install -e \".[baselines]\"`)")
-        except Exception as exc:  # noqa: BLE001 - baseline libs are version-fragile
-            print(f"  {label:<22} SKIPPED (failed: {type(exc).__name__}: {exc})")
-            gc.collect(); torch.cuda.empty_cache()
-
-    external("gptq", "gptq (auto-gptq)",
-             lambda: gptq_baseline(args.model, tok, calib, args.device_map))
-    external("awq", "awq (autoawq)",
-             lambda: awq_baseline(args.model, tok))
+    for key, label, builder, bits in build_methods(
+            Ctx(args, tok, calib, dev, DMAP, BNB_MAP)):
+        if args.only and key not in args.only:
+            continue
+        guarded(key, label, builder, bits=bits)
 
     # Markdown table (stdout + a reproducible file under results/).
     fp16_row = next((r for r in rows if r["method"] == "fp16"), None)

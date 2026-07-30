@@ -136,7 +136,6 @@ celerybeat.pid
 .env
 .venv
 env/
-venv/
 ENV/
 env.bak/
 venv.bak/
@@ -177,11 +176,9 @@ cython_debug/
 
 # AtlasInfer
 results_smoke/   # scratch benchmark output (results/ IS committed)
-*.log
 
 # Secrets — never commit HF tokens / credentials (they live in ~/.cache/huggingface,
 # outside this repo, but ignore these patterns defensively just in case)
-.env
 .env.*
 *.token
 *token*.txt
@@ -192,3 +189,7 @@ credentials*
 
 # PyPI configuration file
 .pypirc
+
+# Preflight/smoke runs and raw logs: local evidence, not committed results.
+results/_smoke/
+results/_logs/

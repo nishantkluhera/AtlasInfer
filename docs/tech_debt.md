@@ -191,6 +191,33 @@ scales plus a sparse outlier pass — days of specialist work, on a platform
 **Recommendation: do (2), not (3).** Given the kernels won't be a headline claim,
 knowing the number is worth far more than closing the gap.
 
+### RESULT (option 2, run 2026-07-30) — worse than expected
+
+`PAPER/exp/kernel_format_accuracy.py` on Qwen2.5-0.5B, WikiText-2, 30k tokens.
+(Runs via the eager fallback, which the kernel test asserts is numerically
+identical to the fused path to 3e-4 — so this is measurable without Triton.)
+
+| Config | format | ~bits | MB | Perplexity | Δ vs FP16 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| fp16 | dense | 16 | 942.3 | 11.9064 | +0.0000 |
+| eager int8 (block+outlier) | eager | 8 | 620.9 | 11.9111 | +0.0047 |
+| kernel W8A16 (per-channel) | kernel | 8 | 601.6 | 11.9249 | **+0.0185** |
+| eager nf4 (block+outlier) | eager | 4 | 484.1 | 12.6793 | +0.7729 |
+| kernel W4A16 (per-channel) | kernel | 4 | 431.0 | 26.2955 | **+14.3891** |
+
+**W8A16 is fine** (+0.019, essentially lossless) — the INT8 kernel is a genuine,
+usable win: 98% of its ideal bandwidth speedup at no real accuracy cost.
+
+**W4A16 more than doubles perplexity.** Per-channel symmetric int4 with no block
+scales, no outlier handling and no codebook is not a deployable format. Its
+1.78–2.74× batch-1 speedup is therefore a speedup of something nobody would run.
+
+This *raises* the severity of #6 from "unknown gap" to "known, and one half of it
+is unusable", but does not change the recommendation: the fix is still days of
+kernel work for something that still would not reach Marlin. The correct action
+is what has now been done — measure it, state it plainly in the README, and stop
+presenting the W4A16 speedup without the accuracy caveat attached.
+
 ---
 
 ## P4 — Lower priority, batch when convenient
@@ -247,26 +274,70 @@ Designed to run alongside the Lightning work, not block it.
 Both were correctness hazards on paid hardware. Nothing else on this list should
 have preceded them.
 
-### Phase 1 — during the cloud runs (~1 day, no GPU needed)
-- **#4** extract `atlasinfer/evaluation.py`
-- **#7** point the consistency test at JSON
-- **#9** move or drop `codebook.py`
-- **#15/#16** whitespace, orphan `.pyc`, `.gitignore` dedupe
+### Phase 1 — **DONE**
+- ~~**#4** extract `atlasinfer/evaluation.py`~~ → `evaluate_perplexity`,
+  `load_wikitext`, `model_weight_bytes`, `resident_bytes` and a new
+  `quantized_bits_per_weight` (the *measured* bits, answering #4's sibling
+  complaint that `avg_bits` is nominal). `benchmark.py` re-exports for
+  compatibility; the three harnesses import the library.
+- ~~**#7** point the consistency test at JSON~~ → prefers
+  `comparison_*.json`, falls back to markdown for pre-JSON result sets.
+- ~~**#9** move or drop `codebook.py`~~ → `atlasinfer/experimental/codebook.py`
+  with a subpackage docstring saying nothing in it backs a claim.
+- ~~**#15/#16**~~ → 33 trailing-whitespace lines stripped, orphan `.pyc` removed,
+  3 duplicate `.gitignore` entries dropped.
 
-All are CPU-only refactors that can proceed while GPU jobs run.
+### Phase 2 — **DONE**
+- ~~**#3** `tests/test_inference.py`~~ → 16 tests. Required one small library
+  change: `parse_args()` read `sys.argv` directly and now takes an optional
+  `argv`, which is what made the CLI testable at all.
+- ~~**#5** `METHODS` registry~~ → `build_methods(ctx)` is module-level and
+  inspectable without a GPU; `main()` 275 → 178 lines. Adds `--only`, so a
+  failed arm can be re-run for the cost of that arm instead of the whole
+  comparison. Profiling is memoized and skipped entirely when no arm needs it.
+- ~~**#6 option 2** measure kernel-path accuracy~~ → done, and the answer was
+  worse than expected (see the RESULT block above).
 
-### Phase 2 — after results land (~2 days)
-- **#3** `tests/test_inference.py`
-- **#5** `METHODS` registry in `compare_baselines.py` (unlocks `--only`, which
-  makes cheap targeted re-runs possible)
-- **#6 option 2** measure kernel-path accuracy — turns the biggest unknown into a
-  number
-
-### Phase 3 — only if the project continues past the technical report
-- **#10** offload tests, **#12** README split, **#13** GPU CI runner,
-  **#11** sweep the tuned constants
+### Phase 3 — **DONE**
+- ~~**#10** offload tests~~ → 18 tests. Found that unknown architectures raise
+  rather than no-op, which is the better contract; test now pins it, and pins
+  the `layer_patterns` escape hatch the error message advertises.
+- ~~**#12** README split~~ → 702 → 339 lines; benchmarks moved to
+  `docs/benchmarks.md` with a docs index in the README. The consistency test now
+  searches both files, so a table stays guarded wherever it lives.
+- ~~**#13** GPU CI runner~~ → no self-hosted runner, but
+  `docs/gpu_test_checklist.md` documents exactly what CI cannot verify and how to
+  verify it by hand, and CI emits a warning naming the skipped tests.
+- ~~**#11** tuned constants~~ → `MAD_SCALE` promoted to a named module constant;
+  both it and `_MAX_OUTLIER_FRACTION` are now overridable per call, so their
+  sensitivity is sweepable without editing the library.
+- ~~**#8** `autoawq`~~ → removed from the `baselines` extra (deprecated, pinned to
+  transformers 4.51, predictably fails to install). AtlasInfer's own `awq-nf4`
+  arm covers the mechanism; the external reference is now an explicit opt-in.
+- ~~**#14** `results/` boundary~~ → `results/README.md` states what is committed
+  evidence vs scratch; `results/_smoke/` and `results/_logs/` are gitignored, and
+  `compare_baselines.py --out` keeps a smoke run from overwriting a real result.
 
 ### Explicitly not recommended
 - **#6 option 3** (block-wise Triton kernel). Days of specialist work to make a
   kernel competitive that, per `PAPER/01_go_nogo.md` §2c, still would not reach
-  Marlin. Measure it (option 2), document the gap, move on.
+  Marlin. Measuring it (option 2) was the right call and is now done: the W4A16
+  format costs +14.39 ppl, so the honest action is to caveat the number, not to
+  chase the kernel.
+
+---
+
+## Status after this pass
+
+All 16 items are addressed. Test count went 84 → 152. The two highest-scoring
+items were silent-wrong-result hazards and are fixed; the highest Impact+Risk item
+(#6) is now measured and documented rather than closed, which was the deliberate
+call.
+
+What remains genuinely open, and is a judgement call rather than debt:
+
+- **#6 is documented, not fixed.** The fast path still isn't the accurate path.
+  That is now stated in the README with numbers attached.
+- **`eval_downstream.main()` (121 lines) and the two `gptq.py` functions** were
+  left long. The GPTQ ones are long because the algorithm is sequential and
+  heavily commented; splitting them would hurt readability, not help it.

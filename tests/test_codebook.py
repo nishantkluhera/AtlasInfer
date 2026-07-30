@@ -9,7 +9,7 @@ naive scalar 2-bit grid on real-shaped weights.
 """
 import torch
 
-from atlasinfer.codebook import (
+from atlasinfer.experimental.codebook import (
     quantize_tensor_vq, dequantize_tensor_vq, VectorQuantizedTensor, CODEBOOK_SIZE,
 )
 

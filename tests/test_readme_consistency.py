@@ -19,7 +19,11 @@ import re
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-README = os.path.join(ROOT, "README.md")
+# The benchmark tables live in docs/benchmarks.md; the top-level README quotes a
+# couple of headline figures. Both are searched so the guard keeps working
+# wherever a table is moved, rather than silently passing when a table it was
+# meant to check is no longer where it looked.
+_DOC_CANDIDATES = ("README.md", os.path.join("docs", "benchmarks.md"))
 
 # Marker name in README  ->  results/<safe>.json basename.
 BENCH_TABLES = {
@@ -55,8 +59,20 @@ def _num(cell: str) -> float:
 
 
 def _read_readme() -> str:
-    with open(README, encoding="utf-8") as f:
-        return f.read()
+    """Concatenated docs that may carry generated tables.
+
+    Concatenating rather than picking one file means a table stays checked after
+    it is moved between the README and docs/benchmarks.md -- the failure mode this
+    guards against is a number going stale, not a file being reorganised.
+    """
+    parts = []
+    for rel in _DOC_CANDIDATES:
+        path = os.path.join(ROOT, rel)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                parts.append(f.read())
+    assert parts, f"none of {_DOC_CANDIDATES} exist"
+    return "\n\n".join(parts)
 
 
 def _table_rows(block: str):
@@ -102,9 +118,25 @@ def test_benchmark_table_matches_json(marker, safe):
 
 
 def _comparison_deltas(safe: str):
-    """method-label -> delta-vs-fp16 from a results/comparison_<safe>.md table."""
+    """method-label -> delta-vs-fp16 for a comparison run.
+
+    Prefers ``results/<safe>.json`` (generated, machine-readable, carries run
+    provenance) and falls back to re-parsing the markdown for older result sets
+    that predate the JSON output. Parsing rendered markdown to verify numbers is
+    exactly the fragility this test exists to prevent, so the JSON is the path
+    that should win.
+    """
+    json_path = os.path.join(ROOT, "results", f"{safe}.json")
+    if os.path.exists(json_path):
+        with open(json_path, encoding="utf-8") as f:
+            payload = json.load(f)
+        rows = payload["rows"] if isinstance(payload, dict) else payload
+        fp16 = next((r["ppl"] for r in rows if r["method"] == "fp16"), None)
+        assert fp16 is not None, f"{json_path} has no fp16 reference row"
+        return {r["method"]: r.get("delta_vs_fp16", r["ppl"] - fp16) for r in rows}
+
     path = os.path.join(ROOT, "results", f"{safe}.md")
-    assert os.path.exists(path), f"missing {path}"
+    assert os.path.exists(path), f"missing both {json_path} and {path}"
     deltas = {}
     with open(path, encoding="utf-8") as f:
         for line in f:

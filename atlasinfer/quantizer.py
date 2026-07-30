@@ -38,6 +38,15 @@ INT4_MAX = 7.0
 # block normally. See ``_find_outliers``.
 _MAX_OUTLIER_FRACTION = 0.25
 
+# sigma_hat = MAD / k. The asymptotic constant is k = Phi^{-1}(0.75) = 0.6745 (so
+# `threshold` reads in sigma units), but the sample MAD is downward-biased at
+# small block sizes, which would make sigma_hat too small and roughly double the
+# fraction flagged on clean weights (eroding compression). k = 0.60 is calibrated
+# so the flagged fraction on clean Gaussian blocks at the sizes we use (64-128)
+# matches the intended ~1% at threshold 2.5-3.0, while masked clusters (the ones
+# mean/std lets hide) are still caught.
+MAD_SCALE = 0.60
+
 # NF4 (NormalFloat-4, from QLoRA): 16 levels placed at the quantiles of a unit
 # normal distribution, normalized to [-1, 1] with an exact 0. Because LLM weights
 # are roughly Gaussian, a grid matched to that distribution wastes far fewer codes
@@ -88,7 +97,9 @@ class QuantizedTensor(NamedTuple):
 
 
 def _find_outliers(
-    blocks: torch.Tensor, threshold: float, num_valid: Optional[int] = None
+    blocks: torch.Tensor, threshold: float, num_valid: Optional[int] = None,
+    max_outlier_fraction: Optional[float] = None,
+    mad_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Boolean per-block mask of elements ``threshold`` robust std-devs from center.
 
@@ -126,6 +137,11 @@ def _find_outliers(
     """
     block_size = blocks.shape[1]
     n_pad = (blocks.numel() - num_valid) if num_valid is not None else 0
+    # Both constants are overridable so their sensitivity can be swept without
+    # editing the library (see MAD_SCALE / _MAX_OUTLIER_FRACTION for how each was
+    # calibrated). Defaults are what every committed result used.
+    cap = _MAX_OUTLIER_FRACTION if max_outlier_fraction is None else max_outlier_fraction
+    k = MAD_SCALE if mad_scale is None else mad_scale
 
     median = blocks.median(dim=1, keepdim=True).values
     if n_pad > 0:  # recompute the padded tail block's center from real elements
@@ -138,24 +154,18 @@ def _find_outliers(
         real = blocks[-1, : block_size - n_pad]
         mad[-1, 0] = (real - median[-1, 0]).abs().median()
 
-    # sigma_hat = MAD / k. The asymptotic constant is k = Phi^{-1}(0.75) = 0.6745
-    # (so `threshold` reads in sigma units), but sample MAD is downward-biased at
-    # small block sizes, which would make sigma_hat too small and roughly double
-    # the fraction flagged on clean weights (eroding compression). k = 0.60 is
-    # calibrated so the flagged fraction on clean Gaussian blocks at the sizes we
-    # use (64-128) matches the intended ~1% at threshold 2.5-3.0, while masked
-    # clusters (the ones mean/std lets hide) are still caught. Clamp so a
+    # sigma_hat = MAD / k; see MAD_SCALE for how k is calibrated. Clamp so a
     # (near-)constant block doesn't divide by ~0 and flag everything.
-    robust_std = torch.clamp(mad / 0.60, min=1e-6)
+    robust_std = torch.clamp(mad / k, min=1e-6)
     z = dev / robust_std
     mask = z > threshold
     if n_pad > 0:  # padding is an artifact, never an outlier
         mask[-1, block_size - n_pad :] = False
     # Drop the mask when it covers too much of a block (see docstring): flagging
-    # more than _MAX_OUTLIER_FRACTION means the block is degenerate or genuinely
-    # wide, and extracting that many values as sparse FP16 would invert the
-    # compression, so quantize it normally instead.
-    keep = mask.float().mean(dim=1, keepdim=True) <= _MAX_OUTLIER_FRACTION
+    # more than the cap means the block is degenerate or genuinely wide, and
+    # extracting that many values as sparse FP16 would invert the compression, so
+    # quantize it normally instead.
+    keep = mask.float().mean(dim=1, keepdim=True) <= cap
     return mask & keep
 
 
