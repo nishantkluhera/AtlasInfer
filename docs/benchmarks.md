@@ -116,10 +116,11 @@ cost is a fused kernel, below.
 dequant-GEMM** Triton kernels for both INT8 (`W8A16`) and packed INT4 (`W4A16`):
 they read the low-bit weights directly (half / a quarter of FP16's bytes),
 dequantize them in-register, and do the matmul in a single pass — no full-weight
-materialization. At batch-1 decode (memory-bandwidth bound) both beat FP16.
-Measured on an RTX 3060 under WSL2 (`bench_triton_kernel.py`, best-of-3, torch
-2.5.1+cu124 / Triton 3.1.0; full table + correctness notes in
-[results/triton_kernel_rtx3060.md](../results/triton_kernel_rtx3060.md)):
+materialization. Measured on an RTX 3060 Laptop under WSL2 (torch 2.5.1+cu124 /
+Triton 3.1.0). **Generated**, not transcribed — full table, per-window samples
+and correctness notes in
+[`results/triton_kernel_NVIDIA_GeForce_RTX_3060_Laptop_GPU.md`](../results/triton_kernel_NVIDIA_GeForce_RTX_3060_Laptop_GPU.md)
+and its `.json`.
 
 Because batch-1 is bandwidth-bound, reading half (int8) or a quarter (int4) of
 the weight bytes makes ~2× and ~4× *available for free*. So the honest column is
@@ -127,19 +128,27 @@ not the speedup — it's how much of that headroom the kernel actually captures:
 
 | matmul shape (M, K, N) | fp16 | fused W8A16 | fused W4A16 | W8 vs fp16 (of 2.0× ideal) | W4 vs fp16 (of 4.0× ideal) |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| (1, 4096, 4096)  | 0.156 ms | 0.099 ms | 0.088 ms | **1.58×** (79%) | 1.78× (45%) |
-| (1, 4096, 11008) | 0.337 ms | 0.173 ms | 0.123 ms | **1.95×** (98%) | 2.74× (69%) |
-| (1, 5120, 5120)  | 0.198 ms | 0.112 ms | 0.109 ms | **1.78×** (89%) | 1.82× (46%) |
-| (16, 4096, 4096) | 0.134 ms | 0.088 ms | 0.129 ms | 1.52× (76%) | 1.04× (26%) |
+| (1, 4096, 4096)  | 0.113 ms | 0.076 ms | 0.078 ms | 1.49× (74%) | 1.45× (36%) |
+| (1, 4096, 11008) | 0.288 ms | 0.146 ms | 0.110 ms | **1.97×** (98%) | 2.62× (66%) |
+| (1, 5120, 5120)  | 0.172 ms | 0.098 ms | 0.095 ms | 1.76× (88%) | 1.82× (45%) |
+| (4, 4096, 4096)  | 0.108 ms | 0.073 ms | 0.078 ms | 1.48× (74%) | 1.39× (35%) |
+| (16, 4096, 4096) | 0.114 ms | 0.079 ms | 0.108 ms | 1.45× (72%) | 1.06× (27%) |
 
 **Being straight about what this shows.** The FP16 baseline is *not* a straw man —
-`F.linear` reaches 285-300 GB/s, about 85-89% of the card's 336 GB/s peak
-(192-bit at 14 Gbps; nvidia-smi reports a 7001 MHz memory clock). Against it,
-**W8A16 is genuinely good**: 1.95× of an available 2.0×. **W4A16 is not**: it
-captures only 26–68% of its headroom, and by M=16 it has collapsed to 1.04× —
+`F.linear` reaches 313 GB/s, 93% of the card's 336 GB/s peak (192-bit at 14 Gbps;
+`nvidia-smi` reports a 7001 MHz memory clock). Against it, **W8A16 is genuinely
+good**: 1.97× of an available 2.0× at the largest shape. **W4A16 is not**: it
+captures only 27–66% of its headroom, and by M=16 it has collapsed to 1.06× —
 where [Marlin](https://arxiv.org/abs/2408.11743) sustains close to the full 4×.
 So these kernels beat FP16, but the 4-bit one does **not** compete with a
 state-of-the-art quantized kernel, and no such comparison has been run here.
+
+> **On quoting these numbers.** Within a single run the FP16 baseline is stable to
+> 1–6%, but *across* invocations the small shapes swing far more — `(1, 4096, 4096)`
+> has been observed anywhere from 1.01× to 1.66×, because Triton autotunes once
+> per shape and the tile it lands on depends on the clock state at that moment.
+> Only `(1, 4096, 11008)` is consistently ~2.0× for W8A16 across runs. Quote that
+> one, or quote a range — not a small-shape figure to two decimals.
 
 ### What the kernel format costs in accuracy
 

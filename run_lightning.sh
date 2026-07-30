@@ -96,8 +96,27 @@ setup() {
   fi
   "$PY" -m pip install -q -e '.[benchmark,eval]' bitsandbytes || {
     echo "ERROR: core install failed. Nothing downstream can work."; return 1; }
-  # Real GPTQ + AWQ reference baselines (optional; skip if the install is painful):
-  "$PY" -m pip install -q optimum gptqmodel autoawq || echo "(external GPTQ/AWQ baselines optional -- continuing without them)"
+  # Real GPTQ reference baseline (optional). Installed separately from autoawq so
+  # that autoawq -- deprecated, and pinned to transformers 4.51 -- cannot take the
+  # GPTQ baseline down with it when pip resolves them together.
+  "$PY" -m pip install -q optimum gptqmodel || \
+    echo "(external GPTQ baseline optional -- continuing without it)"
+  # autoawq last: most likely to fail, least important (AtlasInfer's own awq-nf4
+  # arm covers the mechanism). Failure here must not affect anything above.
+  "$PY" -m pip install -q autoawq 2>/dev/null || \
+    echo "(autoawq unavailable -- deprecated upstream; using AtlasInfer's awq-nf4 instead)"
+  # Report what actually landed, so a missing backend is visible NOW rather than
+  # as a cryptic failure hours into the paid run.
+  "$PY" - <<'PYEOF'
+for mod, why in [("bitsandbytes", "bnb-int8 / bnb-nf4 rows"),
+                 ("gptqmodel", "external gptq (auto-gptq) row"),
+                 ("awq", "external awq (autoawq) row")]:
+    try:
+        __import__(mod)
+        print(f"  baseline OK      {mod:<14} -> {why}")
+    except Exception as e:
+        print(f"  baseline MISSING {mod:<14} -> {why} will be SKIPPED ({type(e).__name__})")
+PYEOF
   "$PY" -c "import torch;print('CUDA', torch.cuda.is_available(), torch.cuda.get_device_name(0))" || return 1
   # Full import chain, incl. the scipy/sklearn path transformers pulls in. This is
   # the check that would have caught the NumPy 1.x/2.x ABI break immediately.

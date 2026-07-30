@@ -65,6 +65,22 @@ def gptq_baseline(model_name, tokenizer, calib, device_map):
     path uses, so it's a like-for-like 4-bit comparison of the error-compensation
     machinery rather than a different calibration set.
     """
+    # Check the backend up front. Without `gptqmodel` installed, transformers
+    # constructs the config fine and then dies deep inside with
+    # `NameError: name 'QuantizeConfig' is not defined` -- which says nothing
+    # about the actual cause. Raising ImportError here means the caller's guard
+    # prints the "not installed, pip install -e '.[baselines]'" message instead.
+    try:
+        import gptqmodel  # noqa: F401
+    except ImportError:
+        try:
+            import auto_gptq  # noqa: F401  (older backend, still accepted)
+        except ImportError:
+            raise ImportError(
+                "no GPTQ backend -- install `gptqmodel` (or legacy `auto-gptq`). "
+                "transformers otherwise fails later with a misleading "
+                "NameError: QuantizeConfig") from None
+
     from transformers import GPTQConfig
     calib_docs = [t for t in calib if t.strip()][:128]
     qc = GPTQConfig(bits=4, dataset=calib_docs, tokenizer=tokenizer,

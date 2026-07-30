@@ -27,20 +27,27 @@ tk = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(tk)
 
 
-def bench(fn, iters=300, warmup=50):
+def bench(fn, iters=300, warmup=50, windows=5):
+    """Best-of-N timing windows; returns (best_ms, all_window_ms).
+
+    Best-of rather than mean because the distribution is right-skewed by clock
+    and thermal noise on a laptop GPU. All windows are returned so the spread can
+    be REPORTED rather than hidden: at small shapes this benchmark has been seen
+    to vary ~50% between invocations, which makes a single number to two decimal
+    places actively misleading.
+    """
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-    # Best-of-3 timing windows to reduce laptop-GPU clock/thermal noise.
-    best = float("inf")
-    for _ in range(3):
+    samples = []
+    for _ in range(windows):
         torch.cuda.synchronize()
         t0 = time.time()
         for _ in range(iters):
             fn()
         torch.cuda.synchronize()
-        best = min(best, (time.time() - t0) / iters * 1e3)
-    return best  # ms
+        samples.append((time.time() - t0) / iters * 1e3)
+    return min(samples), samples  # ms
 
 
 def main():
@@ -49,7 +56,7 @@ def main():
     ap.add_argument("--out", default="results")
     ap.add_argument("--peak-bw", type=float, default=None,
                     help="theoretical peak HBM bandwidth in GB/s; enables the "
-                         "bandwidth-efficiency columns (RTX 3060 Laptop = 288)")
+                         "bandwidth-efficiency line (RTX 3060 Laptop = 336)")
     args = ap.parse_args()
 
     assert torch.cuda.is_available(), "need CUDA"
@@ -76,8 +83,8 @@ def main():
     rows = []
     print(f"{'shape (M,K,N)':>20} | {'fp16':>8} | {'w8a16':>8} | {'w4a16':>8} | "
           f"{'w8/fp16':>8} | {'w4/fp16':>8} | {'w8 eff':>7} | {'w4 eff':>7} | "
-          f"{'w8 err':>7} | {'w4 err':>7}")
-    print("-" * 118)
+          f"{'w8 err':>7} | {'w4 err':>7} | {'fp16 sd':>7}")
+    print("-" * 130)
     for (M, K, N) in shapes:
         x = torch.randn(M, K, device=dev, dtype=torch.float16)
         W = torch.randn(N, K, device=dev, dtype=torch.float16) * 0.05
@@ -97,9 +104,12 @@ def main():
         e8 = ((ref - f_w8().float()).norm() / ref.norm()).item()
         e4 = ((ref - f_w4().float()).norm() / ref.norm()).item()
 
-        t_fp16 = bench(f_fp16)
-        t_w8 = bench(f_w8)
-        t_w4 = bench(f_w4)
+        t_fp16, s_fp16 = bench(f_fp16)
+        t_w8, s_w8 = bench(f_w8)
+        t_w4, s_w4 = bench(f_w4)
+        # Spread of the FP16 baseline is the honesty check: if the reference is
+        # unstable, every speedup derived from it is unstable too.
+        spread16 = (max(s_fp16) - min(s_fp16)) / max(s_fp16) * 100
 
         # Weight bytes streamed per call, and the bandwidth that implies.
         wb16 = K * N * 2
@@ -109,9 +119,10 @@ def main():
         # Fraction of the ideal (bandwidth-bound) speedup actually captured.
         eff8, eff4 = (t_fp16 / t_w8) / 2.0, (t_fp16 / t_w4) / 4.0
 
+        flag = " !" if spread16 > 10 else ""
         print(f"{str((M,K,N)):>20} | {t_fp16:8.4f} | {t_w8:8.4f} | {t_w4:8.4f} | "
               f"{t_fp16/t_w8:7.2f}x | {t_fp16/t_w4:7.2f}x | {eff8*100:6.1f}% | "
-              f"{eff4*100:6.1f}% | {e8:7.4f} | {e4:7.4f}")
+              f"{eff4*100:6.1f}% | {e8:7.4f} | {e4:7.4f} | {spread16:5.1f}%{flag}")
         rows.append({
             "M": M, "K": K, "N": N,
             "ms_fp16": t_fp16, "ms_w8a16": t_w8, "ms_w4a16": t_w4,
@@ -120,6 +131,9 @@ def main():
             "efficiency_w8": eff8, "efficiency_w4": eff4,
             "gbps_fp16": bw16, "gbps_w8a16": bw8, "gbps_w4a16": bw4,
             "rel_err_w8": e8, "rel_err_w4": e4,
+            "fp16_spread_pct": spread16,
+            "ms_fp16_samples": s_fp16, "ms_w8a16_samples": s_w8,
+            "ms_w4a16_samples": s_w4,
         })
 
     if args.peak_bw:
@@ -141,7 +155,7 @@ def main():
         "torch": torch.__version__,
         "triton": getattr(getattr(tk, "triton", None), "__version__", "unknown"),
         "peak_bw_gbps": args.peak_bw,
-        "iters": 300, "warmup": 50, "timing": "best-of-3 windows",
+        "iters": 300, "warmup": 50, "timing": "best-of-5 windows",
         "note": ("Synthetic torch.randn matrices, single GEMM. This is NOT "
                  "end-to-end decode -- see results/latency_*.json for that."),
         "rows": rows,
@@ -156,15 +170,24 @@ def main():
     md = [
         f"### Fused Triton kernels — {gpu}",
         "",
-        f"`bench_triton_kernel.py`, best-of-3 windows of {300} iters, torch "
+        f"`bench_triton_kernel.py`, best-of-5 windows of {300} iters, torch "
         f"{torch.__version__} / Triton {payload['triton']}. Latency in ms.",
         "",
         "**Read the efficiency columns, not the speedups.** At batch-1 the matmul is "
         "bound by weight streaming, so int8 gets ~2x and int4 ~4x for free; what "
         "matters is how much of that headroom the kernel captures.",
         "",
-        "| shape (M, K, N) | fp16 | W8A16 | W4A16 | W8 vs fp16 (of 2.0x) | W4 vs fp16 (of 4.0x) | W8 err | W4 err |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "**The `fp16 spread` column is WITHIN-run only** (across the 5 timing "
+        "windows of a single invocation) and understates the real uncertainty. "
+        "Across separate invocations on a laptop GPU, the (1, 4096, 4096) row has "
+        "been observed anywhere from 1.01x to 1.66x — Triton autotunes once per "
+        "shape, so whichever tile it picks depends on the clock state at that "
+        "moment. Quote the largest shape (1, 4096, 11008), which is consistently "
+        "~2.0x for W8A16 across runs, or quote a range. Do not quote a small-shape "
+        "number to two decimal places.",
+        "",
+        "| shape (M, K, N) | fp16 | W8A16 | W4A16 | W8 vs fp16 (of 2.0x) | W4 vs fp16 (of 4.0x) | W8 err | W4 err | fp16 spread |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for r in rows:
         md.append(
@@ -172,7 +195,17 @@ def main():
             f"{r['ms_w8a16']:.4f} | {r['ms_w4a16']:.4f} | "
             f"{r['speedup_w8']:.2f}x ({r['efficiency_w8']*100:.0f}%) | "
             f"{r['speedup_w4']:.2f}x ({r['efficiency_w4']*100:.0f}%) | "
-            f"{r['rel_err_w8']:.4f} | {r['rel_err_w4']:.4f} |")
+            f"{r['rel_err_w8']:.4f} | {r['rel_err_w4']:.4f} | "
+            f"{r['fp16_spread_pct']:.1f}%{' ⚠' if r['fp16_spread_pct'] > 10 else ''} |")
+    over = [r for r in rows if max(r["efficiency_w8"], r["efficiency_w4"]) > 1.0]
+    if over:
+        md += ["", "> ⚠ One or more rows show **efficiency above 100%**, which is "
+                   "impossible for a purely bandwidth-bound comparison: the kernel "
+                   "cannot beat the ceiling set by reading half (or a quarter) of "
+                   "the bytes. It means the FP16 reference ran slow in this "
+                   "invocation, so the speedups here are optimistic. Shapes "
+                   "affected: " + ", ".join(f"({r['M']}, {r['K']}, {r['N']})"
+                                             for r in over) + "."]
     if args.peak_bw:
         best = max(r["gbps_fp16"] for r in rows)
         pct = best / args.peak_bw * 100

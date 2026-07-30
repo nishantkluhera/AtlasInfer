@@ -212,6 +212,14 @@ usable win: 98% of its ideal bandwidth speedup at no real accuracy cost.
 scales, no outlier handling and no codebook is not a deployable format. Its
 1.78–2.74× batch-1 speedup is therefore a speedup of something nobody would run.
 
+**Cross-validated on both execution paths.** The table above was first measured on
+Windows via the eager dequant fallback (no Triton). Re-running it under WSL2 with
+the fused Triton kernels actually active gives W8A16 +0.0174 and W4A16 +14.3926 —
+within 0.004 ppl of the fallback numbers. So the result is a property of the
+quantization *format*, not an artifact of how it was executed, and the script's
+claim that the fallback is numerically equivalent to the kernel is now verified
+rather than assumed.
+
 This *raises* the severity of #6 from "unknown gap" to "known, and one half of it
 is unusable", but does not change the recommendation: the fix is still days of
 kernel work for something that still would not reach Marlin. The correct action
