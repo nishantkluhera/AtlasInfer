@@ -1,0 +1,309 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B",
+  "eval_tokens": 30000,
+  "seed": 0,
+  "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "torch": "2.5.1+cu124",
+  "fp16_ppl": 11.90661907196045,
+  "uniform_nf4": {
+    "mb": 484.05238914489746,
+    "ppl": 12.679512977600098,
+    "delta": 0.7728939056396484
+  },
+  "iso_memory_or_better": [
+    {
+      "arm": "knapsack-3.4",
+      "nominal_bits": 3.4,
+      "ppl": 15.052751541137695,
+      "mb": 457.39758682250977,
+      "measured_bits_per_weight": 4.6324949383298994,
+      "seconds": 18.2,
+      "counts": {
+        "int4": 48,
+        "int3": 112,
+        "int8": 8
+      },
+      "delta_vs_fp16": 3.146132469177246,
+      "pct_cut_vs_uniform_nf4": -307.0587756250324,
+      "mb_vs_uniform_nf4": -26.654802322387695
+    },
+    {
+      "arm": "greedy-3.4",
+      "nominal_bits": 3.4,
+      "ppl": 15.05257511138916,
+      "mb": 457.6061153411865,
+      "measured_bits_per_weight": 4.637383518987523,
+      "seconds": 17.5,
+      "counts": {
+        "int3": 109,
+        "int4": 51,
+        "int8": 8
+      },
+      "delta_vs_fp16": 3.145956039428711,
+      "pct_cut_vs_uniform_nf4": -307.03594846243635,
+      "mb_vs_uniform_nf4": -26.446273803710938
+    },
+    {
+      "arm": "knapsack-3.6",
+      "nominal_bits": 3.6,
+      "ppl": 14.314020156860352,
+      "mb": 465.8400459289551,
+      "measured_bits_per_weight": 4.830413393572573,
+      "seconds": 16.7,
+      "counts": {
+        "int4": 74,
+        "int3": 85,
+        "int8": 9
+      },
+      "delta_vs_fp16": 2.4074010848999023,
+      "pct_cut_vs_uniform_nf4": -211.478854644032,
+      "mb_vs_uniform_nf4": -18.212343215942383
+    },
+    {
+      "arm": "greedy-3.6",
+      "nominal_bits": 3.6,
+      "ppl": 14.455695152282715,
+      "mb": 465.7102451324463,
+      "measured_bits_per_weight": 4.82737044449691,
+      "seconds": 16.9,
+      "counts": {
+        "int3": 92,
+        "int4": 64,
+        "int8": 12
+      },
+      "delta_vs_fp16": 2.5490760803222656,
+      "pct_cut_vs_uniform_nf4": -229.8093129887789,
+      "mb_vs_uniform_nf4": -18.342144012451172
+    },
+    {
+      "arm": "knapsack-3.8",
+      "nominal_bits": 3.8,
+      "ppl": 13.916461944580078,
+      "mb": 473.65587615966797,
+      "measured_bits_per_weight": 5.013641648065477,
+      "seconds": 17.4,
+      "counts": {
+        "int4": 80,
+        "int3": 73,
+        "int8": 13,
+        "fp16": 2
+      },
+      "delta_vs_fp16": 2.009842872619629,
+      "pct_cut_vs_uniform_nf4": -160.04123696075456,
+      "mb_vs_uniform_nf4": -10.396512985229492
+    },
+    {
+      "arm": "greedy-3.8",
+      "nominal_bits": 3.8,
+      "ppl": 13.979569435119629,
+      "mb": 473.8103427886963,
+      "measured_bits_per_weight": 5.017262843764309,
+      "seconds": 16.6,
+      "counts": {
+        "int3": 75,
+        "int4": 79,
+        "int8": 13,
+        "fp16": 1
+      },
+      "delta_vs_fp16": 2.0729503631591797,
+      "pct_cut_vs_uniform_nf4": -168.20632793625177,
+      "mb_vs_uniform_nf4": -10.242046356201172
+    },
+    {
+      "arm": "knapsack-4.0",
+      "nominal_bits": 4.0,
+      "ppl": 13.490545272827148,
+      "mb": 481.6589603424072,
+      "measured_bits_per_weight": 5.2012597387963595,
+      "seconds": 14.8,
+      "counts": {
+        "int8": 19,
+        "int4": 88,
+        "int3": 58,
+        "fp16": 3
+      },
+      "delta_vs_fp16": 1.5839262008666992,
+      "pct_cut_vs_uniform_nf4": -104.9344922128528,
+      "mb_vs_uniform_nf4": -2.3934288024902344
+    },
+    {
+      "arm": "greedy-4.0",
+      "nominal_bits": 4.0,
+      "ppl": 13.589744567871094,
+      "mb": 481.67288970947266,
+      "measured_bits_per_weight": 5.201586288060898,
+      "seconds": 18.2,
+      "counts": {
+        "int4": 85,
+        "int8": 20,
+        "int3": 61,
+        "fp16": 2
+      },
+      "delta_vs_fp16": 1.6831254959106445,
+      "pct_cut_vs_uniform_nf4": -117.76928031508889,
+      "mb_vs_uniform_nf4": -2.3794994354248047
+    }
+  ],
+  "rows": [
+    {
+      "arm": "fp16",
+      "nominal_bits": 16.0,
+      "ppl": 11.90661907196045,
+      "mb": 942.292724609375,
+      "measured_bits_per_weight": 16.0,
+      "seconds": 5.9
+    },
+    {
+      "arm": "uniform-nf4",
+      "nominal_bits": 4.0,
+      "ppl": 12.679512977600098,
+      "mb": 484.05238914489746,
+      "measured_bits_per_weight": 5.257369425008585,
+      "seconds": 12.9
+    },
+    {
+      "arm": "uniform-nf3",
+      "nominal_bits": 3.0,
+      "ppl": 18.825035095214844,
+      "mb": 441.39613914489746,
+      "measured_bits_per_weight": 4.257369425008585,
+      "seconds": 20.3
+    },
+    {
+      "arm": "knapsack-3.4",
+      "nominal_bits": 3.4,
+      "ppl": 15.052751541137695,
+      "mb": 457.39758682250977,
+      "measured_bits_per_weight": 4.6324949383298994,
+      "seconds": 18.2,
+      "counts": {
+        "int4": 48,
+        "int3": 112,
+        "int8": 8
+      }
+    },
+    {
+      "arm": "greedy-3.4",
+      "nominal_bits": 3.4,
+      "ppl": 15.05257511138916,
+      "mb": 457.6061153411865,
+      "measured_bits_per_weight": 4.637383518987523,
+      "seconds": 17.5,
+      "counts": {
+        "int3": 109,
+        "int4": 51,
+        "int8": 8
+      }
+    },
+    {
+      "arm": "knapsack-3.6",
+      "nominal_bits": 3.6,
+      "ppl": 14.314020156860352,
+      "mb": 465.8400459289551,
+      "measured_bits_per_weight": 4.830413393572573,
+      "seconds": 16.7,
+      "counts": {
+        "int4": 74,
+        "int3": 85,
+        "int8": 9
+      }
+    },
+    {
+      "arm": "greedy-3.6",
+      "nominal_bits": 3.6,
+      "ppl": 14.455695152282715,
+      "mb": 465.7102451324463,
+      "measured_bits_per_weight": 4.82737044449691,
+      "seconds": 16.9,
+      "counts": {
+        "int3": 92,
+        "int4": 64,
+        "int8": 12
+      }
+    },
+    {
+      "arm": "knapsack-3.8",
+      "nominal_bits": 3.8,
+      "ppl": 13.916461944580078,
+      "mb": 473.65587615966797,
+      "measured_bits_per_weight": 5.013641648065477,
+      "seconds": 17.4,
+      "counts": {
+        "int4": 80,
+        "int3": 73,
+        "int8": 13,
+        "fp16": 2
+      }
+    },
+    {
+      "arm": "greedy-3.8",
+      "nominal_bits": 3.8,
+      "ppl": 13.979569435119629,
+      "mb": 473.8103427886963,
+      "measured_bits_per_weight": 5.017262843764309,
+      "seconds": 16.6,
+      "counts": {
+        "int3": 75,
+        "int4": 79,
+        "int8": 13,
+        "fp16": 1
+      }
+    },
+    {
+      "arm": "knapsack-4.0",
+      "nominal_bits": 4.0,
+      "ppl": 13.490545272827148,
+      "mb": 481.6589603424072,
+      "measured_bits_per_weight": 5.2012597387963595,
+      "seconds": 14.8,
+      "counts": {
+        "int8": 19,
+        "int4": 88,
+        "int3": 58,
+        "fp16": 3
+      }
+    },
+    {
+      "arm": "greedy-4.0",
+      "nominal_bits": 4.0,
+      "ppl": 13.589744567871094,
+      "mb": 481.67288970947266,
+      "measured_bits_per_weight": 5.201586288060898,
+      "seconds": 18.2,
+      "counts": {
+        "int4": 85,
+        "int8": 20,
+        "int3": 61,
+        "fp16": 2
+      }
+    },
+    {
+      "arm": "knapsack-4.25",
+      "nominal_bits": 4.25,
+      "ppl": 13.340672492980957,
+      "mb": 490.85810470581055,
+      "measured_bits_per_weight": 5.416917335594094,
+      "seconds": 14.9,
+      "counts": {
+        "int8": 30,
+        "int4": 81,
+        "int3": 53,
+        "fp16": 4
+      }
+    },
+    {
+      "arm": "greedy-4.25",
+      "nominal_bits": 4.25,
+      "ppl": 13.407832145690918,
+      "mb": 490.6395835876465,
+      "measured_bits_per_weight": 5.41179449619391,
+      "seconds": 14.6,
+      "counts": {
+        "int8": 26,
+        "int4": 77,
+        "fp16": 7,
+        "int3": 58
+      }
+    }
+  ]
+}

@@ -560,6 +560,71 @@ perplexity of the thing you benchmarked for speed?"), and the answer is bad. K6
 was already a FAIL on competitiveness grounds; it is now also a FAIL on the more
 basic ground that half the speed claim describes a broken model.
 
+### K3 — now genuinely measurable, and it **FAILS**
+
+§2b said an iso-memory comparison against uniform NF4 was unmeasurable by
+construction, because INT4 was the allocator's cheapest tier. A 3-bit **NF3**
+tier was added specifically to remove that floor (see `atlasinfer/quantizer.py`,
+`tests/test_nf3.py`). The comparison is now real — and mixed precision loses.
+
+`PAPER/exp/iso_memory.py`, Qwen2.5-0.5B, WikiText-2, 30k tokens:
+
+| Config | MB | vs NF4 | Δ ppl vs FP16 |
+| --- | ---: | ---: | ---: |
+| uniform NF4 | 484.1 | — | **+0.773** |
+| knapsack @ nominal 4.0 | 481.7 | −2.4 | +1.584 |
+| knapsack @ nominal 3.8 | 473.7 | −10.4 | +2.010 |
+| knapsack @ nominal 3.6 | 465.8 | −18.2 | +2.407 |
+| knapsack @ nominal 3.4 | 457.4 | −26.7 | +3.146 |
+| uniform NF3 | 441.4 | −42.7 | +6.918 |
+
+**Every allocation at or below uniform NF4's footprint is worse than uniform
+NF4** — the closest one (2.4 MB cheaper) more than doubles the penalty.
+
+**Why, quantitatively.** The trade requires demoting layers 4→3 bit to fund
+promoting others 4→8 bit. On this model:
+
+- demoting costs **0.144 ppl per MB saved** (NF3 is brutal here: +6.92 vs FP16),
+- promoting gains **0.0056 ppl per MB spent**,
+- an exchange rate of **25.7× against the trade**. It needs to be under 1× to pay.
+
+This is exactly the condition `tests/test_nf3.py` pins in the abstract: the trade
+requires heterogeneous sensitivity, and a 26× cliff at 3 bits swamps any
+heterogeneity that exists. No allocator — optimal or otherwise — can win against
+that exchange rate.
+
+**What this settles.** "Cuts 4-bit perplexity loss ~35% *at equal memory* vs
+uniform quantization" is not merely unmeasured; on a 0.5B model it is **false, in
+the opposite direction**. The defensible claim remains the one from §2f: a
+16–43% reduction vs *random allocation at matched memory*, in the 4.25–6 bit band.
+
+**The one route left**, not pursued here: 3-bit is known to be far less
+destructive on larger models, and GPTQ error compensation helps most exactly
+where quantization is most aggressive. If GPTQ-NF3 at 7B brought the demotion
+cost down by ~25×, the trade would turn positive. That is a large ask, and
+believing it without measuring would be exactly the error this document exists to
+prevent — but it is a legitimate 2-credit experiment on the Lightning budget.
+
+### K5 — small update: the DP's edge grows with the number of tiers
+
+With three tiers {fp16, int8, int4} the DP and a benefit-per-byte greedy were
+indistinguishable (§2f: mean gap 0.006 ppl, 7.5× inside noise). With **four**
+tiers the DP wins at 4 of 5 budgets by 0.06–0.14 ppl:
+
+| nominal bits | knapsack | greedy | gap |
+| ---: | --- | --- | ---: |
+| 3.4 | 15.0528 | 15.0526 | −0.0002 |
+| 3.6 | **14.3140** | 14.4557 | +0.1417 |
+| 3.8 | **13.9165** | 13.9796 | +0.0631 |
+| 4.0 | **13.4905** | 13.5897 | +0.0992 |
+| 4.25 | **13.3407** | 13.4078 | +0.0672 |
+
+That is consistent in sign and at the **upper edge of** the noise floor measured
+in §2f (random-allocation spread 0.015–0.083 ppl), not clearly above it. The
+honest reading: more tiers means more combinatorial structure for the DP to
+exploit, so its advantage plausibly grows — but on this evidence it is a small
+effect, and K5's verdict (the signal matters more than the solver) stands.
+
 ### Effect on the verdict: **unchanged — still Option 3.**
 
 The pre-registered rule is "K1 fails **and** (K3 or K5) fails → Option 3." K5 now
