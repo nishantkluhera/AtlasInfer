@@ -48,9 +48,10 @@ from atlasinfer.patcher import quantize_model, quantize_model_mixed
 from atlasinfer.sensitivity import SensitivityProfiler
 from atlasinfer.allocator import allocate_optimal
 from atlasinfer.gptq import quantize_model_gptq
-from atlasinfer.linear import QuantizedLinear, QuantizedLinear4bit
+from atlasinfer.linear import QuantizedLinear, QuantizedLinear3bit, QuantizedLinear4bit
 from atlasinfer.quantizer import (
-    dequantize_tensor, dequantize_tensor_nf4, dequantize_tensor_fp4,
+    dequantize_tensor, dequantize_tensor_nf3, dequantize_tensor_nf4,
+    dequantize_tensor_fp4,
 )
 from atlasinfer.evaluation import load_wikitext, model_weight_bytes
 
@@ -78,6 +79,9 @@ def densify_for_eval(model: nn.Module) -> nn.Module:
         for attr, child in parent.named_children():
             if isinstance(child, QuantizedLinear):
                 w = dequantize_tensor(child.quantized_weights, device=child.q_data.device)
+            elif isinstance(child, QuantizedLinear3bit):
+                w = dequantize_tensor_nf3(child.quantized_weights,
+                                          device=child.q_packed.device)
             elif isinstance(child, QuantizedLinear4bit):
                 deq = dequantize_tensor_nf4 if child.scheme == "nf4" else dequantize_tensor_fp4
                 w = deq(child.quantized_weights, device=child.q_packed.device)

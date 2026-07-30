@@ -89,13 +89,13 @@ def quantize_model_mixed(
     # so say so loudly. Warn-only: a partial allocation is a legitimate input.
     check_allocation_covers(allocation, [t[3] for t in targets],
                             context="quantize_model_mixed")
-    stats = {"fp16": 0, "int8": 0, "int4": 0}
+    stats = {"fp16": 0, "int8": 0, "int4": 0, "int3": 0}
     original_size = 0
     quantized_size = 0
 
     for parent, attr, module, full_name in targets:
         precision = allocation.get(full_name, default_precision).lower()
-        precision = {"fp8": "int8", "fp4": "int4"}.get(precision, precision)
+        precision = {"fp8": "int8", "fp4": "int4", "nf3": "int3"}.get(precision, precision)
 
         orig_bytes = _dense_bytes(module)
         original_size += orig_bytes
@@ -121,7 +121,7 @@ def quantize_model_mixed(
         label_4bit = quant_4bit.upper()
         print(f"Quantization complete ({mode}):")
         print(f"  FP16: {stats['fp16']}  INT8: {stats['int8']}  "
-              f"{label_4bit}: {stats['int4']} layers")
+              f"{label_4bit}: {stats['int4']}  NF3: {stats['int3']} layers")
         print(f"  {original_size / 1024**2:.1f} MB -> {quantized_size / 1024**2:.1f} MB "
               f"({ratio:.2f}x smaller)")
 
@@ -130,6 +130,7 @@ def quantize_model_mixed(
 
 def get_model_info(model: nn.Module) -> dict:
     """Counts of dense vs quantized linear layers in the model."""
+    from .linear import QuantizedLinear3bit
     from .triton_kernels import W8A16Linear, W4A16Linear
 
     info = {
@@ -137,6 +138,7 @@ def get_model_info(model: nn.Module) -> dict:
         "linear_count": 0,
         "quantized_linear_count": 0,
         "quantized_linear_4bit_count": 0,
+        "quantized_linear_3bit_count": 0,
         "w8a16_kernel_count": 0,
         "w4a16_kernel_count": 0,
         "other_count": 0,
@@ -145,7 +147,10 @@ def get_model_info(model: nn.Module) -> dict:
     }
     for name, module in model.named_modules():
         info["total_modules"] += 1
-        if isinstance(module, QuantizedLinear4bit):
+        if isinstance(module, QuantizedLinear3bit):
+            info["quantized_linear_3bit_count"] += 1
+            info["quantized_names"].append(name)
+        elif isinstance(module, QuantizedLinear4bit):
             info["quantized_linear_4bit_count"] += 1
             info["quantized_names"].append(name)
         elif isinstance(module, W8A16Linear):

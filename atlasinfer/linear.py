@@ -251,6 +251,96 @@ class QuantizedLinear4bit(nn.Module):
         )
 
 
+class QuantizedLinear3bit(nn.Module):
+    """Linear layer backed by packed 3-bit NF3 weights.
+
+    The sub-4-bit tier. Exists so the allocator has an option *cheaper* than
+    INT4: without it the cheapest possible allocation is uniform 4-bit, and any
+    "mixed precision at equal memory to uniform NF4" comparison is vacuous. With
+    it, robust layers drop to 3 bits and the freed budget buys INT8 on the
+    fragile ones at the same or lower total footprint.
+    """
+
+    def __init__(
+        self,
+        quantized_weights: "QuantizedTensor3bit",
+        bias: Optional[torch.Tensor] = None,
+        in_features: Optional[int] = None,
+        out_features: Optional[int] = None,
+    ):
+        super().__init__()
+        self.precision = "int3"
+        self.scheme = "nf3"
+
+        self.register_buffer("q_packed", quantized_weights.packed_data)
+        self.register_buffer("q_scales", quantized_weights.scales)
+        self.register_buffer("q_outlier_indices", quantized_weights.outlier_indices)
+        self.register_buffer("q_outlier_values", quantized_weights.outlier_values)
+        self._original_shape = quantized_weights.original_shape
+        self._block_size = quantized_weights.block_size
+        self._num_elements = quantized_weights.num_elements
+
+        if bias is not None:
+            self.register_buffer("bias", bias)
+        else:
+            self.bias = None
+
+        if in_features is None or out_features is None:
+            shape = quantized_weights.original_shape
+            self.out_features = shape[0]
+            self.in_features = shape[1] if len(shape) > 1 else shape[0]
+        else:
+            self.in_features = in_features
+            self.out_features = out_features
+
+    @property
+    def quantized_weights(self) -> "QuantizedTensor3bit":
+        from .quantizer import QuantizedTensor3bit
+        return QuantizedTensor3bit(
+            packed_data=self.q_packed,
+            scales=self.q_scales,
+            outlier_indices=self.q_outlier_indices,
+            outlier_values=self.q_outlier_values,
+            original_shape=self._original_shape,
+            block_size=self._block_size,
+            num_elements=self._num_elements,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from .quantizer import dequantize_tensor_nf3
+        in_dtype = x.dtype
+        weight = dequantize_tensor_nf3(self.quantized_weights, device=x.device)
+        bias = self.bias.to(weight.dtype) if self.bias is not None else None
+        return F.linear(x.to(weight.dtype), weight, bias).to(in_dtype)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bias={self.bias is not None}, precision={self.precision}"
+        )
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear: nn.Linear,
+        block_size: int = 64,
+        outlier_threshold: float = 2.5,
+    ) -> "QuantizedLinear3bit":
+        from .quantizer import quantize_tensor_nf3
+
+        quantized_weights = quantize_tensor_nf3(
+            linear.weight.data.cpu(), block_size=block_size,
+            outlier_threshold=outlier_threshold,
+        )
+        bias = linear.bias.data.clone() if linear.bias is not None else None
+        return cls(
+            quantized_weights=quantized_weights,
+            bias=bias,
+            in_features=linear.in_features,
+            out_features=linear.out_features,
+        )
+
+
 def _conv1d_to_linear(conv1d: nn.Module) -> nn.Linear:
     """Convert a HuggingFace Conv1D (GPT-2 style) into an equivalent nn.Linear."""
     # Conv1D stores weight as (in_features, out_features); nn.Linear wants (out, in).
@@ -292,7 +382,7 @@ def create_quantized_linear(
     """
     precision = precision.lower()
     # Backwards-compatible aliases from the old (misleading) FP8/FP4 naming.
-    precision = {"fp8": "int8", "fp4": "int4"}.get(precision, precision)
+    precision = {"fp8": "int8", "fp4": "int4", "nf3": "int3"}.get(precision, precision)
 
     # Normalise Conv1D into nn.Linear up front.
     if type(linear).__name__ == "Conv1D":
@@ -300,6 +390,13 @@ def create_quantized_linear(
 
     if precision == "fp16":
         return linear
+    elif precision == "int3":
+        # No fused kernel at 3 bits; use_kernel is ignored here on purpose rather
+        # than silently falling back to a different bit-width.
+        return QuantizedLinear3bit.from_linear(
+            linear, block_size=block_size_int4,
+            outlier_threshold=outlier_threshold_int4,
+        )
     elif precision == "int8":
         if use_kernel:
             from .triton_kernels import W8A16Linear

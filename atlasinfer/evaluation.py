@@ -29,11 +29,11 @@ _CALIB_MAX_DOCS = 256
 
 def model_weight_bytes(model: torch.nn.Module) -> int:
     """Resident weight footprint: quantized buffers + remaining dense params."""
-    from .linear import QuantizedLinear, QuantizedLinear4bit
+    from .linear import QuantizedLinear, QuantizedLinear3bit, QuantizedLinear4bit
 
     total = sum(p.numel() * p.element_size() for p in model.parameters())
     for module in model.modules():
-        if isinstance(module, (QuantizedLinear, QuantizedLinear4bit)):
+        if isinstance(module, (QuantizedLinear, QuantizedLinear3bit, QuantizedLinear4bit)):
             total += module.quantized_weights.memory_bytes()
             if module.bias is not None:
                 total += module.bias.numel() * module.bias.element_size()
@@ -141,14 +141,14 @@ def quantized_bits_per_weight(model: torch.nn.Module) -> float:
     phrased in bits.
     """
     from ._targets import DEFAULT_EXCLUDE, is_excluded
-    from .linear import QuantizedLinear, QuantizedLinear4bit
+    from .linear import QuantizedLinear, QuantizedLinear3bit, QuantizedLinear4bit
 
     bits = 0
     params = 0
     for name, module in model.named_modules():
         if is_excluded(name, DEFAULT_EXCLUDE):
             continue
-        if isinstance(module, (QuantizedLinear, QuantizedLinear4bit)):
+        if isinstance(module, (QuantizedLinear, QuantizedLinear3bit, QuantizedLinear4bit)):
             qb = module.quantized_weights.memory_bytes()
             n = int(math.prod(module.quantized_weights.original_shape))
         elif isinstance(module, torch.nn.Linear):

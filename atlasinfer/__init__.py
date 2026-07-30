@@ -15,6 +15,7 @@ Pipeline:
 __version__ = "2.1.0"
 
 from .quantizer import (
+    QuantizedTensor3bit, quantize_tensor_nf3, dequantize_tensor_nf3,
     quantize_tensor, dequantize_tensor, QuantizedTensor,
     quantize_tensor_fp4, dequantize_tensor_fp4, QuantizedTensor4bit,
     quantize_tensor_nf4, dequantize_tensor_nf4, NF4_LEVELS,
@@ -61,6 +62,8 @@ __all__ = [
     # Allocation
     "PrecisionLevel", "AllocationResult", "get_layer_sizes",
     "allocate_optimal", "allocate_greedy", "uniform_allocation",
+    "QuantizedTensor3bit", "quantize_tensor_nf3", "dequantize_tensor_nf3",
+    "QuantizedLinear3bit",
     "estimate_memory_usage", "print_allocation_report",
     # Fused kernel
     "HAS_TRITON", "kernel_available", "W8A16Linear", "W4A16Linear",

@@ -23,7 +23,7 @@ import torch.nn as nn
 from .linear import create_quantized_linear
 
 # Default precisions the profiler measures (besides the implicit lossless fp16).
-DEFAULT_PRECISIONS = ("int8", "int4")
+DEFAULT_PRECISIONS = ("int8", "int4", "int3")
 
 # Penalty assigned to a layer the profiler couldn't measure. Large and
 # quality-ordered so the allocator keeps such a layer at FP16 whenever the budget

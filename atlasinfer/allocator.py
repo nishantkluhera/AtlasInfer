@@ -27,6 +27,7 @@ class PrecisionLevel(Enum):
     FP16 = "fp16"
     INT8 = "int8"
     INT4 = "int4"
+    INT3 = "int3"
 
     @property
     def bytes_per_param(self) -> float:
@@ -34,6 +35,7 @@ class PrecisionLevel(Enum):
             PrecisionLevel.FP16: 2.0,
             PrecisionLevel.INT8: 1.0,
             PrecisionLevel.INT4: 0.5,
+            PrecisionLevel.INT3: 0.375,
         }[self]
 
 
@@ -42,6 +44,11 @@ BYTES_PER_PARAM: Dict[str, float] = {
     "fp16": 2.0,
     "int8": 1.0,
     "int4": 0.5,
+    # 3 bits/weight, packed 8 codes per 3 bytes (see quantizer.NF3_LEVELS). This
+    # tier is what makes an iso-memory comparison against uniform 4-bit possible
+    # at all: without an option cheaper than int4, the allocator's minimum
+    # footprint IS uniform int4.
+    "int3": 0.375,
 }
 
 
@@ -64,7 +71,7 @@ class AllocationResult:
 
     def summary(self) -> str:
         parts = ", ".join(
-            f"{p.upper()}={self.counts.get(p, 0)}" for p in ("fp16", "int8", "int4")
+            f"{p.upper()}={self.counts.get(p, 0)}" for p in ("fp16", "int8", "int4", "int3")
         )
         return (
             f"Allocation: {parts} | "
@@ -98,7 +105,7 @@ def _layer_bytes(param_count: int, precision: str) -> int:
 def allocate_optimal(
     profiles: Dict[str, "object"],
     budget_bytes: int,
-    precisions: List[str] = ("fp16", "int8", "int4"),
+    precisions: List[str] = ("fp16", "int8", "int4", "int3"),
     num_buckets: int = 4096,
 ) -> AllocationResult:
     """Minimum-error precision assignment within a byte budget.
@@ -234,7 +241,7 @@ def allocate_greedy(
     sensitivities: Dict[str, float],
     layer_sizes: Dict[str, int],
     budget_bytes: int,
-    precisions: List[str] = ("fp16", "int8", "int4"),
+    precisions: List[str] = ("fp16", "int8", "int4", "int3"),
     profiles: Optional[Dict[str, "object"]] = None,
 ) -> AllocationResult:
     """Baseline allocator: the classic **benefit-per-byte** greedy for a
@@ -270,10 +277,27 @@ def allocate_greedy(
     """
     import heapq
 
-    ordered = sorted(precisions, key=lambda p: BYTES_PER_PARAM.get(p, 2.0))
+    all_ordered = sorted(precisions, key=lambda p: BYTES_PER_PARAM.get(p, 2.0))
     names = [n for n in sensitivities if n in layer_sizes]
-    alloc = {name: ordered[0] for name in names}
-    current = sum(_layer_bytes(layer_sizes[n], ordered[0]) for n in names)
+
+    def _tiers(name: str) -> List[str]:
+        """Precisions actually available for ``name``, cheapest first.
+
+        Mirrors ``allocate_optimal``: a tier the layer has no measured error for
+        is not an option. Without this, adding a new tier to ``precisions``
+        (e.g. int3) would silently offer it for layers profiled before that tier
+        existed, and the greedy would start them at a bit-width whose cost it
+        cannot justify against any measurement.
+        """
+        if profiles is None or name not in profiles:
+            return all_ordered
+        errs = profiles[name].errors
+        avail = [p for p in all_ordered if p == "fp16" or p in errs]
+        return avail or [all_ordered[-1]]  # never return empty; fall back to fp16
+
+    tiers = {name: _tiers(name) for name in names}
+    alloc = {name: tiers[name][0] for name in names}
+    current = sum(_layer_bytes(layer_sizes[n], alloc[n]) for n in names)
 
     def _err(name: str, precision: str) -> float:
         """Measured error of ``name`` at ``precision`` (FP16 is lossless)."""
@@ -285,15 +309,16 @@ def allocate_greedy(
                 return e
         # Fallback: scale the scalar sensitivity by how aggressive the tier is,
         # so a cheaper precision always scores as at least as lossy.
-        return sensitivities[name] * (BYTES_PER_PARAM.get(ordered[0], 0.5)
+        return sensitivities[name] * (BYTES_PER_PARAM.get(tiers[name][0], 0.5)
                                       / BYTES_PER_PARAM.get(precision, 2.0))
 
     def _step(name: str):
         """The next single upgrade for ``name`` as (-ratio, name, precision, delta)."""
-        idx = ordered.index(alloc[name])
-        if idx + 1 >= len(ordered):
+        order = tiers[name]
+        idx = order.index(alloc[name])
+        if idx + 1 >= len(order):
             return None
-        nxt = ordered[idx + 1]
+        nxt = order[idx + 1]
         delta = _layer_bytes(layer_sizes[name], nxt) - _layer_bytes(layer_sizes[name], alloc[name])
         if delta <= 0:
             return None

@@ -389,6 +389,177 @@ def dequantize_tensor_fp4(qt: QuantizedTensor4bit, device: Optional[torch.device
 
 
 # ============================================================================ #
+# NF3 (NormalFloat-3) - a distribution-matched 3-bit codebook
+#
+# Why this tier exists. With only {fp16, int8, int4} the allocator's cheapest
+# option IS uniform int4, so a mixed allocation can never be smaller than uniform
+# 4-bit -- which makes "mixed precision at equal memory to uniform NF4"
+# unmeasurable by construction (at that budget the DP just returns uniform NF4).
+# A sub-4-bit tier removes the floor: insensitive layers drop to 3 bits, the
+# budget freed pays for INT8 on the fragile ones, and the whole allocation can
+# land at or below uniform-NF4's footprint. See PAPER/01_go_nogo.md 2b.
+#
+# Levels are the QLoRA NormalFloat construction at 8 levels (3 negative, exact
+# zero, 4 positive): quantiles of a unit normal, normalized to [-1, 1]. The same
+# recipe reproduces the NF4 table above to ~1e-7. On N(0,1) this codebook gives
+# 0.304 relative RMSE vs 0.431 for a uniform 8-level grid -- a 30% error
+# reduction for free, the same argument that motivates NF4 over symmetric int4.
+# ============================================================================ #
+NF3_LEVELS = torch.tensor([
+    -1.0, -0.4786291601159111, -0.2171418178257440, 0.0,
+    0.1609301727049362, 0.3379151935216551, 0.5626169700752370, 1.0,
+], dtype=torch.float32)
+
+
+class QuantizedTensor3bit(NamedTuple):
+    """A tensor quantized to packed 3-bit NF3 codes with sparse FP16 outliers.
+
+    Eight 3-bit codes share every three bytes (24 bits), so the packed payload is
+    exactly 3 bits/weight with no wasted padding beyond the final group.
+    """
+    packed_data: torch.Tensor      # uint8, 8 codes per 3 bytes
+    scales: torch.Tensor           # per-block absmax (FP32)
+    outlier_indices: torch.Tensor  # INT32 positions into the flattened tensor
+    outlier_values: torch.Tensor   # FP16 values at those positions
+    original_shape: torch.Size
+    block_size: int
+    num_elements: int
+
+    def to(self, device: torch.device) -> "QuantizedTensor3bit":
+        return QuantizedTensor3bit(
+            packed_data=self.packed_data.to(device),
+            scales=self.scales.to(device),
+            outlier_indices=self.outlier_indices.to(device),
+            outlier_values=self.outlier_values.to(device),
+            original_shape=self.original_shape,
+            block_size=self.block_size,
+            num_elements=self.num_elements,
+        )
+
+    def block_scales(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        return self.scales.to(device) if device is not None else self.scales
+
+    def memory_bytes(self) -> int:
+        return (
+            self.packed_data.numel() * self.packed_data.element_size()
+            + self.scales.numel() * self.scales.element_size()
+            + self.outlier_indices.numel() * self.outlier_indices.element_size()
+            + self.outlier_values.numel() * self.outlier_values.element_size()
+        )
+
+
+def _pack3(codes: torch.Tensor) -> torch.Tensor:
+    """Pack 3-bit codes (values 0-7) eight-at-a-time into three bytes.
+
+    Bit layout per group of 8 codes c0..c7:
+        byte0 = c0 | c1<<3 | (c2 & 0b011)<<6
+        byte1 = c2>>2 | c3<<1 | c4<<4 | (c5 & 0b001)<<7
+        byte2 = c5>>1 | c6<<2 | c7<<5
+    24 bits in, 8 codes out -- exactly 3 bits per weight.
+    """
+    g = codes.reshape(-1, 8).to(torch.int32)
+    b0 = (g[:, 0]) | (g[:, 1] << 3) | ((g[:, 2] & 0x3) << 6)
+    b1 = (g[:, 2] >> 2) | (g[:, 3] << 1) | (g[:, 4] << 4) | ((g[:, 5] & 0x1) << 7)
+    b2 = (g[:, 5] >> 1) | (g[:, 6] << 2) | (g[:, 7] << 5)
+    return torch.stack([b0, b1, b2], dim=1).reshape(-1).to(torch.uint8)
+
+
+def _unpack3(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of :func:`_pack3`; returns int64 codes in [0, 7]."""
+    p = packed.reshape(-1, 3).to(torch.int32)
+    c = [
+        p[:, 0] & 0x7,
+        (p[:, 0] >> 3) & 0x7,
+        ((p[:, 0] >> 6) & 0x3) | ((p[:, 1] & 0x1) << 2),
+        (p[:, 1] >> 1) & 0x7,
+        (p[:, 1] >> 4) & 0x7,
+        ((p[:, 1] >> 7) & 0x1) | ((p[:, 2] & 0x3) << 1),
+        (p[:, 2] >> 2) & 0x7,
+        (p[:, 2] >> 5) & 0x7,
+    ]
+    return torch.stack(c, dim=1).reshape(-1).to(torch.long)
+
+
+def quantize_tensor_nf3(
+    tensor: torch.Tensor, block_size: int = 64, outlier_threshold: float = 2.5,
+) -> QuantizedTensor3bit:
+    """Quantize to packed NF3 codes with per-block absmax scales + sparse outliers.
+
+    Mirrors :func:`quantize_tensor_nf4` exactly -- same block structure, same
+    robust median/MAD outlier detector, same absmax normalization -- differing
+    only in codebook size and bit packing.
+    """
+    num_elements = tensor.numel()
+    dev = tensor.device
+    if num_elements == 0:
+        return QuantizedTensor3bit(
+            torch.empty(0, dtype=torch.uint8, device=dev),
+            torch.empty(0, dtype=torch.float32, device=dev),
+            torch.empty(0, dtype=torch.int32, device=dev),
+            torch.empty(0, dtype=torch.float16, device=dev),
+            tensor.shape, block_size, 0,
+        )
+
+    flat = tensor.float().flatten()
+    padded = math.ceil(num_elements / block_size) * block_size
+    if padded > num_elements:
+        flat = torch.nn.functional.pad(flat, (0, padded - num_elements))
+    blocks = flat.view(-1, block_size)
+
+    outlier_blocks = _find_outliers(blocks, outlier_threshold, num_valid=num_elements)
+    clean = blocks.clone()
+    clean[outlier_blocks] = 0.0
+    absmax = clean.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+
+    normalized = blocks / absmax
+    boundaries = ((NF3_LEVELS[:-1] + NF3_LEVELS[1:]) / 2).to(blocks.device)
+    codes = torch.bucketize(normalized.reshape(-1), boundaries).clamp_(0, 7)
+    codes = codes[:num_elements]
+
+    outlier_flat = outlier_blocks.view(-1)[:num_elements]
+    oidx = outlier_flat.nonzero(as_tuple=True)[0].to(torch.int32)
+    oval = tensor.flatten()[oidx.long()].to(torch.float16)
+
+    # Pad to a whole number of 8-code groups before packing.
+    pack_size = math.ceil(num_elements / 8) * 8
+    if pack_size > num_elements:
+        codes = torch.nn.functional.pad(codes, (0, pack_size - num_elements))
+
+    return QuantizedTensor3bit(
+        packed_data=_pack3(codes).to(dev),
+        scales=absmax.squeeze(1).to(dev),
+        outlier_indices=oidx.to(dev),
+        outlier_values=oval.to(dev),
+        original_shape=tensor.shape,
+        block_size=block_size,
+        num_elements=num_elements,
+    )
+
+
+def dequantize_tensor_nf3(qt: QuantizedTensor3bit,
+                          device: Optional[torch.device] = None) -> torch.Tensor:
+    """Reconstruct an FP16 tensor from NF3-coded :class:`QuantizedTensor3bit`."""
+    if device is None:
+        device = qt.packed_data.device
+    if qt.num_elements == 0:
+        return torch.empty(qt.original_shape, dtype=torch.float16, device=device)
+
+    codes = _unpack3(qt.packed_data.to(device))[: qt.num_elements]
+    levels = NF3_LEVELS.to(device)[codes]
+
+    block_size = qt.block_size
+    padded = math.ceil(qt.num_elements / block_size) * block_size
+    if padded > qt.num_elements:
+        levels = torch.nn.functional.pad(levels, (0, padded - qt.num_elements))
+    blocks = levels.view(-1, block_size) * qt.scales.to(device).view(-1, 1)
+    out = blocks.view(-1)[: qt.num_elements].to(torch.float16)
+
+    if qt.outlier_indices.numel() > 0:
+        out[qt.outlier_indices.to(device).long()] = qt.outlier_values.to(device)
+    return out.view(qt.original_shape)
+
+
+# ============================================================================ #
 # NF4 (NormalFloat-4) - a distribution-matched 4-bit codebook
 # ============================================================================ #
 def quantize_tensor_nf4(
