@@ -467,4 +467,72 @@ guard are all genuinely good work. The problem is not quality. It is that the
 ideas were published first by people with 70B-scale compute, and the parts that
 were not published first are not, on measurement, competitive.
 
+---
+
+## 2f. Post-verdict update (2026-07-30, same day)
+
+Two of the open items from §2e were closed immediately after the verdict, because
+both were blocked only on code that did not exist. Both results move the picture,
+and one of them is the best number this project has produced.
+
+### K4 — RESOLVED, positively. The composition works.
+
+`quantize_model_gptq` now accepts an `allocation`, so GPTQ error compensation can
+be applied *within* a mixed-precision assignment. Measured on GPT-2 (WikiText-2,
+2k eval tokens — a **preflight, not a headline measurement**; raw output in
+`PAPER/exp/results/comparison_gpt2.json`):
+
+| Method | ~bits | Weights (MB) | Perplexity | Δ vs FP16 |
+| --- | ---: | ---: | ---: | ---: |
+| fp16 | 16 | 249.4 | 21.265 | +0.000 |
+| AtlasInfer nf4 | 4 | 139.6 | 22.254 | +0.989 |
+| AtlasInfer gptq-nf4 | 4 | 139.6 | 21.799 | +0.534 |
+| AtlasInfer mixed-5bit (knapsack) | 5.0 | 147.7 | 21.952 | +0.687 |
+| AtlasInfer greedy-5bit | 5.0 | 147.7 | 21.847 | +0.582 |
+| **AtlasInfer gptq-mixed-5bit** | 5.0 | **147.7** | **21.240** | **−0.025** |
+
+Composing the two mechanisms takes the 4-bit GPTQ penalty from **+0.534 to
+−0.025** — effectively lossless — for 8 MB (5.8%) more memory, at **59% of the
+FP16 footprint**. The mechanisms stack, as predicted: the allocator chooses where
+bits go, GPTQ compensates the residual at whatever width it lands on.
+
+**Caveats, because one preflight is not a result.** 2k eval tokens is a small,
+noisy window; the negative delta is certainly noise and the honest reading is
+"indistinguishable from FP16," not "better than FP16." One model, one seed, and
+GPT-2 is the oldest and most forgiving architecture here. This needs to replicate
+at 7B and on ≥2 other families before it is load-bearing. **It is now the first
+thing the Lightning credits should buy.**
+
+### K5 — WEAKER. The fixed greedy beats the DP.
+
+With `allocate_greedy` replaced by a proper benefit-per-byte greedy (given the
+same measured per-precision errors the DP optimizes), the same preflight shows
+**greedy 21.847 vs knapsack DP 21.952 at identical memory** — the heuristic *wins*.
+
+This is what MCKP theory predicts (the LP-relaxation greedy is within one item of
+optimal) and it confirms §2d's suspicion. It also means the earlier 8.6–33.2%
+"DP beats greedy" margins were entirely an artifact of the broken baseline. The
+allocation *signal* still beats random decisively; the *exact DP* does not earn
+its keep. A full re-run of the ablation on Qwen2.5-0.5B with the fixed greedy is
+in flight.
+
+### Effect on the verdict: **unchanged — still Option 3.**
+
+The pre-registered rule is "K1 fails **and** (K3 or K5) fails → Option 3." K5 now
+fails outright, so the rule fires cleanly where before it was ambiguous. The
+novelty position is no better than it was, and the composition result — while
+genuinely good — is the thing APTQ and oQ+ already published.
+
+What *does* change is the technical report's headline. It is no longer
+"knapsack allocation beats uniform," a claim that is both pre-empted and only
+half-supported. It is:
+
+> **Sensitivity-driven mixed precision composed with GPTQ error compensation is
+> essentially lossless at ~5 bits — 59% of FP16 memory — and a simple
+> benefit-per-byte greedy is sufficient; the exact knapsack solve is not needed.**
+
+That is a more useful, more honest, and more defensible claim than the one the
+project started with, and the negative result about the DP is part of what makes
+it credible.
+
 

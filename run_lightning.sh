@@ -38,7 +38,12 @@
 # still yields a full table of whatever loaded (bitsandbytes always works here).
 set -uo pipefail
 STAGE="${1:-all}"
-MODEL="${2:-Qwen/Qwen3.5-9B-Base}"   # latest open Qwen (Jul 2026); dense fallback: Qwen/Qwen3-8B-Base
+# DENSE by default. The previous default (Qwen/Qwen3.5-9B-Base) is a hybrid
+# Gated-Delta + sparse-MoE architecture: its expert layers only fire for routed
+# tokens, which breaks the sensitivity profiler's assumption that every layer
+# sees every calibration token. On a paid GPU that is a silently-wrong allocation
+# discovered hours in. Pass a model explicitly to override.
+MODEL="${2:-Qwen/Qwen3-8B-Base}"     # dense, open, 2025. Hybrid/MoE: smoke-test first.
 EVAL_TOKENS="${EVAL_TOKENS:-40000}"
 DEVICE_MAP="${DEVICE_MAP:-}"      # set to "--device-map" for 13B+ across >1 GPU
 # Overnight cross-family list. UNGATED ONLY by default so an HF login prompt can
@@ -101,9 +106,27 @@ setup() {
     echo "       numpy-1.x-compiled scipy/sklearn. An isolated venv (USE_VENV=1)"
     echo "       avoids it; if you forced USE_VENV=0, pin 'numpy<2' in the host env."
     return 1; }
-  # Cheap smoke on the latest small model to confirm env + that AtlasInfer quantizes
-  # the (hybrid) arch cleanly BEFORE spending 9B hours:
-  "$PY" compare_baselines.py --model Qwen/Qwen3.5-0.8B-Base --eval-tokens 4000 --skip awq gptq
+  # Cheap smoke BEFORE spending 7B hours. Deliberately does NOT skip gptq: `--skip`
+  # matches by prefix, so `--skip gptq` would also drop gptq-nf4 AND the new
+  # gptq-mixed composition arm -- i.e. the smoke would pass while leaving the most
+  # important new code path completely unexercised, and it would fail hours into
+  # the paid run instead. Only awq (slow, and the most install-fragile) is skipped.
+  # Small DENSE model on purpose: a hybrid/MoE smoke can pass or fail for reasons
+  # that say nothing about the dense 7B you are about to run.
+  "$PY" compare_baselines.py --model Qwen/Qwen2.5-0.5B --eval-tokens 2000 --skip awq || return 1
+  # Assert the composition arm actually produced a row. Without this the smoke is
+  # green whenever gptq-mixed silently FAILED-and-continued (it is `guarded`).
+  "$PY" - <<'PYEOF' || return 1
+import json, sys
+rows = json.load(open("results/comparison_Qwen_Qwen2.5-0.5B.json"))["rows"]
+have = {r["method"].split("-")[0] + ("-mixed" if "gptq-mixed" in r["method"] else "") for r in rows}
+missing = [m for m in ("AtlasInfer gptq-mixed",) if not any(m in r["method"] for r in rows)]
+if missing:
+    print(f"SMOKE FAILED: no row for {missing} -- the composition path errored and "
+          f"was swallowed by the guard. Fix before spending GPU hours.")
+    sys.exit(1)
+print(f"smoke OK: {len(rows)} rows incl. the gptq-mixed composition arm")
+PYEOF
 }
 # Head-to-head vs bitsandbytes (+ real GPTQ/AWQ if installed). THE credibility result.
 compare()    { "$PY" compare_baselines.py --model "$MODEL" --eval-tokens "$EVAL_TOKENS" --double-quant $DEVICE_MAP; }

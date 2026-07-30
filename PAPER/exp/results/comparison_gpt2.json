@@ -1,0 +1,73 @@
+{
+  "model": "gpt2",
+  "eval_tokens": 2000,
+  "seed": 0,
+  "mixed_bits": 5.0,
+  "max_len": 1024,
+  "double_quant": false,
+  "skipped": [
+    "awq"
+  ],
+  "device_map": false,
+  "complete": true,
+  "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+  "torch": "2.5.1+cu121",
+  "rows": [
+    {
+      "method": "fp16",
+      "mb": 249.35009765625,
+      "ppl": 21.265113830566406,
+      "bits": 16,
+      "delta_vs_fp16": 0.0
+    },
+    {
+      "method": "AtlasInfer int8",
+      "mb": 172.58444023132324,
+      "ppl": 21.305818557739258,
+      "bits": 8,
+      "delta_vs_fp16": 0.04070472717285156
+    },
+    {
+      "method": "AtlasInfer int4 (sym)",
+      "mb": 139.57188034057617,
+      "ppl": 23.52216911315918,
+      "bits": 4,
+      "delta_vs_fp16": 2.2570552825927734
+    },
+    {
+      "method": "AtlasInfer nf4",
+      "mb": 139.57188034057617,
+      "ppl": 22.253841400146484,
+      "bits": 4,
+      "delta_vs_fp16": 0.9887275695800781
+    },
+    {
+      "method": "AtlasInfer gptq-nf4",
+      "mb": 139.5718288421631,
+      "ppl": 21.799047470092773,
+      "bits": 4,
+      "delta_vs_fp16": 0.5339336395263672
+    },
+    {
+      "method": "AtlasInfer mixed-5bit",
+      "mb": 147.67447471618652,
+      "ppl": 21.952436447143555,
+      "bits": 5.0,
+      "delta_vs_fp16": 0.6873226165771484
+    },
+    {
+      "method": "AtlasInfer greedy-5bit",
+      "mb": 147.6924934387207,
+      "ppl": 21.846826553344727,
+      "bits": 5.0,
+      "delta_vs_fp16": 0.5817127227783203
+    },
+    {
+      "method": "AtlasInfer gptq-mixed-5bit",
+      "mb": 147.67443466186523,
+      "ppl": 21.239686965942383,
+      "bits": 5.0,
+      "delta_vs_fp16": -0.025426864624023438
+    }
+  ]
+}
