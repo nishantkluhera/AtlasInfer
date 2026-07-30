@@ -110,6 +110,10 @@ def main():
                     help="shard across all GPUs (device_map=auto) for models too big "
                          "for one card, e.g. 7-13B on Kaggle T4x2")
     ap.add_argument("--seed", type=int, default=0, help="RNG seed (reproducibility)")
+    ap.add_argument("--out", default="results",
+                    help="output directory. Point a smoke/preflight run somewhere "
+                         "else (e.g. results/_smoke) so a short-eval run cannot "
+                         "overwrite a committed full-length result for the same model.")
     # Calibration knobs. Previously hardcoded in SensitivityProfiler's defaults,
     # which made "how robust is the allocation to the calibration set?" -- the
     # first question anyone asks about a calibration-driven method -- unanswerable
@@ -147,9 +151,9 @@ def main():
     max_len = min(getattr(cfg, "max_position_embeddings", 1024) or 1024, 1024)
 
     rows = []
-    os.makedirs("results", exist_ok=True)
+    os.makedirs(args.out, exist_ok=True)
     safe = args.model.replace("/", "_")
-    out_json = os.path.join("results", f"comparison_{safe}.json")
+    out_json = os.path.join(args.out, f"comparison_{safe}.json")
 
     def _flush():
         """Persist everything measured so far, after every single row.
@@ -358,7 +362,7 @@ def main():
     table = header + "\n" + body + "\n"
     print("\n" + table)
 
-    out = os.path.join("results", f"comparison_{safe}.md")
+    out = os.path.join(args.out, f"comparison_{safe}.md")
     with open(out, "w", encoding="utf-8") as f:
         f.write(table)
 

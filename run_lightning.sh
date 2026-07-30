@@ -113,19 +113,22 @@ setup() {
   # the paid run instead. Only awq (slow, and the most install-fragile) is skipped.
   # Small DENSE model on purpose: a hybrid/MoE smoke can pass or fail for reasons
   # that say nothing about the dense 7B you are about to run.
-  "$PY" compare_baselines.py --model Qwen/Qwen2.5-0.5B --eval-tokens 2000 --skip awq || return 1
+  # --out keeps this short-eval run out of results/, so it cannot overwrite a
+  # committed full-length comparison for the same model.
+  "$PY" compare_baselines.py --model Qwen/Qwen2.5-0.5B --eval-tokens 2000 \
+        --skip awq --out results/_smoke || return 1
   # Assert the composition arm actually produced a row. Without this the smoke is
   # green whenever gptq-mixed silently FAILED-and-continued (it is `guarded`).
   "$PY" - <<'PYEOF' || return 1
 import json, sys
-rows = json.load(open("results/comparison_Qwen_Qwen2.5-0.5B.json"))["rows"]
-have = {r["method"].split("-")[0] + ("-mixed" if "gptq-mixed" in r["method"] else "") for r in rows}
-missing = [m for m in ("AtlasInfer gptq-mixed",) if not any(m in r["method"] for r in rows)]
+rows = json.load(open("results/_smoke/comparison_Qwen_Qwen2.5-0.5B.json"))["rows"]
+required = ("AtlasInfer gptq-nf4", "AtlasInfer mixed", "AtlasInfer gptq-mixed")
+missing = [m for m in required if not any(r["method"].startswith(m) for r in rows)]
 if missing:
-    print(f"SMOKE FAILED: no row for {missing} -- the composition path errored and "
-          f"was swallowed by the guard. Fix before spending GPU hours.")
+    print(f"SMOKE FAILED: no rows for {missing} -- those paths errored and were "
+          f"swallowed by the `guarded` wrapper. Fix before spending GPU hours.")
     sys.exit(1)
-print(f"smoke OK: {len(rows)} rows incl. the gptq-mixed composition arm")
+print(f"smoke OK: {len(rows)} rows incl. {', '.join(required)}")
 PYEOF
 }
 # Head-to-head vs bitsandbytes (+ real GPTQ/AWQ if installed). THE credibility result.
