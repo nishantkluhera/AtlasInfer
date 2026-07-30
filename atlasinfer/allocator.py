@@ -235,32 +235,86 @@ def allocate_greedy(
     layer_sizes: Dict[str, int],
     budget_bytes: int,
     precisions: List[str] = ("fp16", "int8", "int4"),
+    profiles: Optional[Dict[str, "object"]] = None,
 ) -> AllocationResult:
-    """Baseline allocator: start everyone at the lowest precision, then upgrade
-    the most sensitive layers first while the budget allows.
+    """Baseline allocator: the classic **benefit-per-byte** greedy for a
+    multiple-choice knapsack.
 
-    Kept for comparison against :func:`allocate_optimal`.
+    Starts every layer at the cheapest precision, then repeatedly applies the
+    *single upgrade step* with the best error-reduction-per-byte ratio that still
+    fits the budget. This is the LP-relaxation heuristic for MCKP, which is
+    provably within one item of optimal — so it is a genuinely strong baseline,
+    and the honest thing to compare :func:`allocate_optimal` against.
+
+    .. note::
+       This replaces an earlier greedy that walked layers in sensitivity order
+       and upgraded each one *as far as the budget allowed* before moving on.
+       That version spent the entire budget pushing a handful of top-sensitivity
+       layers all the way to FP16 — at a 4.5-bit budget on Qwen2.5-0.5B it
+       produced ``{fp16: 6, int8: 2, int4: 160}``, a precision histogram nearly
+       identical to *random* allocation, which made it a straw man rather than a
+       baseline. See ``PAPER/01_go_nogo.md`` §2d.
+
+    Args:
+        sensitivities: ``layer_name -> scalar sensitivity``. Used only as a
+            fallback ranking when ``profiles`` is not supplied.
+        layer_sizes: ``layer_name -> parameter count``.
+        budget_bytes: total byte budget.
+        precisions: candidate precision labels.
+        profiles: optional ``layer_name -> LayerProfile``. When given, the
+            benefit of an upgrade is the *measured* error reduction between the
+            two precisions, which is what makes this a fair comparison against
+            the DP (it optimizes the same quantity). Without it, benefit falls
+            back to the scalar sensitivity scaled by the precision gap, which is
+            a cruder but still monotone proxy.
     """
+    import heapq
+
     ordered = sorted(precisions, key=lambda p: BYTES_PER_PARAM.get(p, 2.0))
-    min_precision = ordered[0]
-    alloc = {name: min_precision for name in sensitivities if name in layer_sizes}
+    names = [n for n in sensitivities if n in layer_sizes]
+    alloc = {name: ordered[0] for name in names}
+    current = sum(_layer_bytes(layer_sizes[n], ordered[0]) for n in names)
 
-    def total_bytes(a: Dict[str, str]) -> int:
-        return sum(_layer_bytes(layer_sizes[n], p) for n, p in a.items())
+    def _err(name: str, precision: str) -> float:
+        """Measured error of ``name`` at ``precision`` (FP16 is lossless)."""
+        if precision == "fp16":
+            return 0.0
+        if profiles is not None and name in profiles:
+            e = profiles[name].errors.get(precision)
+            if e is not None:
+                return e
+        # Fallback: scale the scalar sensitivity by how aggressive the tier is,
+        # so a cheaper precision always scores as at least as lossy.
+        return sensitivities[name] * (BYTES_PER_PARAM.get(ordered[0], 0.5)
+                                      / BYTES_PER_PARAM.get(precision, 2.0))
 
-    current = total_bytes(alloc)
-    # Most sensitive first.
-    for name, _ in sorted(sensitivities.items(), key=lambda x: x[1], reverse=True):
-        if name not in alloc:
-            continue
-        cur_idx = ordered.index(alloc[name])
-        for better in ordered[cur_idx + 1:]:
-            delta = _layer_bytes(layer_sizes[name], better) - _layer_bytes(layer_sizes[name], alloc[name])
-            if current + delta <= budget_bytes:
-                current += delta
-                alloc[name] = better
-            else:
-                break
+    def _step(name: str):
+        """The next single upgrade for ``name`` as (-ratio, name, precision, delta)."""
+        idx = ordered.index(alloc[name])
+        if idx + 1 >= len(ordered):
+            return None
+        nxt = ordered[idx + 1]
+        delta = _layer_bytes(layer_sizes[name], nxt) - _layer_bytes(layer_sizes[name], alloc[name])
+        if delta <= 0:
+            return None
+        gain = _err(name, alloc[name]) - _err(name, nxt)
+        return (-gain / delta, name, nxt, delta)
+
+    # Max-heap on benefit-per-byte (negated for heapq's min-heap).
+    heap = [s for s in (_step(n) for n in names) if s is not None]
+    heapq.heapify(heap)
+    while heap:
+        _neg_ratio, name, nxt, delta = heapq.heappop(heap)
+        # Each layer has at most one live heap entry (a successor is pushed only
+        # after its predecessor is popped and applied), so entries are never stale.
+        if current + delta <= budget_bytes:
+            current += delta
+            alloc[name] = nxt
+            nxt_step = _step(name)
+            if nxt_step is not None:
+                heapq.heappush(heap, nxt_step)
+        # If it doesn't fit, drop it: a later, cheaper upgrade may still fit, and
+        # this layer's next step is strictly more expensive.
 
     counts: Dict[str, int] = {}
     for p in alloc.values():
@@ -270,7 +324,7 @@ def allocate_greedy(
         total_bytes=current,
         budget_bytes=budget_bytes,
         counts=counts,
-        predicted_error=0.0,
+        predicted_error=sum(_err(n, p) for n, p in alloc.items()),
         total_params=sum(layer_sizes[n] for n in alloc),
     )
 

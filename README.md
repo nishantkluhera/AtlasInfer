@@ -15,8 +15,18 @@ the budget where it buys the most accuracy.
 Everything here — the block-wise integer quantizer, the calibration-based
 sensitivity profiler, and the budget allocator — is implemented from scratch on
 top of PyTorch (no `bitsandbytes`, no `auto-gptq`), so the whole pipeline is
-inspectable in a few hundred lines. There's also an optional **fused W8A16 Triton
-kernel** that makes batch-1 decode **1.6–1.9× faster than FP16** (Linux/WSL2).
+inspectable in a few hundred lines. There are also optional **fused W8A16/W4A16
+Triton kernels** (Linux/WSL2) that beat an FP16 `F.linear` by **1.5–1.95×** on an
+isolated batch-1 GEMM.
+
+> **Read that kernel number carefully — it is a single-matmul microbenchmark, not
+> decode.** End-to-end generation through the default *eager* path is
+> **slower** than FP16 (0.09–0.64×, [table below](#runtime-memory-vs-latency));
+> AtlasInfer buys **memory**, and the fused kernels claw back matmul time in
+> isolation. End-to-end decode with the fused kernels has not been measured.
+> A fuller accounting of what these kernels do and don't achieve — including the
+> fact that W4A16 captures only 26–68% of the bandwidth headroom a 4-bit weight
+> makes available — is in [PAPER/01_go_nogo.md](PAPER/01_go_nogo.md#2c).
 
 ---
 
@@ -156,10 +166,25 @@ Reproduce any row with `python benchmark.py --model <name>`.
 | mixed-6bit | 6.0 | 553.6 | 12.638 | +0.359 |
 | mixed-7bit | 7.0 | 589.1 | 12.591 | +0.313 |
 
-At ~4.5 bits — essentially the same footprint as uniform 4-bit NF4 — mixed
-precision cuts the perplexity penalty by about a third (here +0.79 → +0.53) by
-spending the extra half-bit only on the layers that hurt most; GPTQ-NF4 does
-better still at the *same* 4-bit footprint (+0.48, see [vs bitsandbytes](#vs-bitsandbytes)).
+At ~4.5 bits mixed precision cuts the perplexity penalty by about a third
+(here +0.79 → +0.53) by spending the extra half-bit only on the layers that hurt
+most — **at a 3.9% memory increase** (484.1 → 502.8 MB), not at equal memory.
+Across the five models the reduction is 24–77% (median ~33%) for +3–5% memory.
+
+Two things this table does **not** say, both worth knowing up front:
+
+- **Mixed precision cannot be cheaper than uniform 4-bit.** INT4 is the cheapest
+  tier the allocator can pick, so an "equal-memory" comparison against uniform
+  NF4 is not measurable — at that budget the allocator *returns* uniform NF4. The
+  meaningful baseline at an in-between footprint is what you'd otherwise do:
+  upgrade some subset of layers to INT8. Measured against a *random* such subset
+  at matched memory, the allocator wins by 16–43%
+  ([ablation](PAPER/exp/results/ablation_Qwen_Qwen2.5-0.5B.json)).
+- **GPTQ-NF4 does better still, at the *same* 4-bit footprint** (+0.48 vs +0.53)
+  and at zero extra memory — see [vs bitsandbytes](#vs-bitsandbytes). On 3 of 4
+  models GPTQ-NF4 beats mixed precision outright. The two mechanisms are
+  orthogonal and `compare_baselines.py` now measures them composed
+  (`gptq-mixed`), which is the open question.
 <!-- /RESULTS:Qwen2.5-0.5B -->
 
 Also validated on older architectures — GPT-2 (124M) and Pythia-410M / 1.4B —
@@ -188,6 +213,14 @@ and decode tok/s vs FP16, all models, 64-token decode on an RTX 3060
 | Pythia-410M | 789, 46.9 | 0.71×, 0.52× | 0.60×, 0.21× | 0.64×, 0.25× |
 | Pythia-1.4B | 2720, 42.7 | 0.66×, 0.24× | 0.53×, 0.09× | 0.58×, 0.10× |
 
+> ⚠️ **Provenance:** these five rows were transcribed by hand from an early
+> `bench_latency.py` stdout run whose output was never committed, so unlike every
+> other table here they cannot be re-checked against a source file. The script now
+> writes `results/latency_<model>.{md,json}` (and reports the spread over repeated
+> runs); **these numbers will be replaced by generated ones on the next run.**
+> Treat the exact digits as indicative and the direction — quantized eager decode
+> is slower than FP16, markedly so at 1.4B — as the finding.
+
 The pattern is consistent: **~30–45% less peak GPU memory for slower decode** in
 the eager path (the codebook dequant is the most expensive) — the right call when
 the goal is *running a model that otherwise wouldn't fit*. The fix for the latency
@@ -204,20 +237,34 @@ Measured on an RTX 3060 under WSL2 (`bench_triton_kernel.py`, best-of-3, torch
 2.5.1+cu124 / Triton 3.1.0; full table + correctness notes in
 [results/triton_kernel_rtx3060.md](results/triton_kernel_rtx3060.md)):
 
-| matmul shape (M, K, N) | fp16 | fused W8A16 | fused W4A16 | W8 vs fp16 | W4 vs fp16 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| (1, 4096, 4096)  | 0.156 ms | 0.099 ms | 0.088 ms | **1.58x** | **1.78x** |
-| (1, 4096, 11008) | 0.337 ms | 0.173 ms | 0.123 ms | **1.95x** | **2.74x** |
-| (1, 5120, 5120)  | 0.198 ms | 0.112 ms | 0.109 ms | **1.78x** | **1.82x** |
+Because batch-1 is bandwidth-bound, reading half (int8) or a quarter (int4) of
+the weight bytes makes ~2× and ~4× *available for free*. So the honest column is
+not the speedup — it's how much of that headroom the kernel actually captures:
 
-The edge narrows as batch grows and the matmul becomes compute- rather than
-bandwidth-bound (≈1.0–1.5x at M=16), exactly as expected. The W8A16 path is
-near-lossless (<1% error); the W4A16 kernel uses per-channel int4 (coarser than
-the default block-wise + outlier INT4), so it trades a little accuracy for the
-4-bit bandwidth — use it when speed matters most. Triton is Linux/GPU-only, so
-this needs **WSL2** on Windows; the module import-guards on `HAS_TRITON` so the
-rest of the library is unaffected. See [docs/wsl_triton.md](docs/wsl_triton.md)
-for the 3-command setup.
+| matmul shape (M, K, N) | fp16 | fused W8A16 | fused W4A16 | W8 vs fp16 (of 2.0× ideal) | W4 vs fp16 (of 4.0× ideal) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| (1, 4096, 4096)  | 0.156 ms | 0.099 ms | 0.088 ms | **1.58×** (79%) | 1.78× (45%) |
+| (1, 4096, 11008) | 0.337 ms | 0.173 ms | 0.123 ms | **1.95×** (98%) | 2.74× (69%) |
+| (1, 5120, 5120)  | 0.198 ms | 0.112 ms | 0.109 ms | **1.78×** (89%) | 1.82× (46%) |
+| (16, 4096, 4096) | 0.134 ms | 0.088 ms | 0.129 ms | 1.52× (76%) | 1.04× (26%) |
+
+**Being straight about what this shows.** The FP16 baseline is *not* a straw man —
+`F.linear` reaches 267 GB/s, about 93% of the card's ~288 GB/s peak. Against it,
+**W8A16 is genuinely good**: 1.95× of an available 2.0×. **W4A16 is not**: it
+captures only 26–68% of its headroom, and by M=16 it has collapsed to 1.04× —
+where [Marlin](https://arxiv.org/abs/2408.11743) sustains close to the full 4×.
+So these kernels beat FP16, but the 4-bit one does **not** compete with a
+state-of-the-art quantized kernel, and no such comparison has been run here.
+
+One further caveat that matters for reading the accuracy tables alongside these:
+the kernels use **per-output-channel symmetric** int8/int4, which is *not* the
+block-wise NF4 + sparse-outlier format every perplexity number on this page was
+measured with. The fast path and the accurate path are different quantizers, and
+no experiment here measures both on the same model.
+
+Triton is Linux/GPU-only, so this needs **WSL2** on Windows; the module
+import-guards on `HAS_TRITON` so the rest of the library is unaffected. See
+[docs/wsl_triton.md](docs/wsl_triton.md) for the 3-command setup.
 
 **It's wired into the engine.** `AtlasInference(..., kernel="auto")` (the default)
 routes INT8 layers through `W8A16Linear` and INT4 layers through `W4A16Linear`
@@ -239,6 +286,13 @@ still runs (just unaccelerated) without Triton.
 > most of the parameters.
 
 ### Kaggle (Tesla T4): a bigger model, and kernel portability
+
+> ⚠️ **Provenance:** every number in this section comes from an interactive
+> Kaggle session whose result files were never committed to this repo. Unlike the
+> tables above, they are **not backed by anything under `results/`** and are not
+> covered by the README-consistency test. They are reported because the 3B
+> datapoint is informative, but they should be re-run and committed before being
+> relied on — or cited as anecdote, not measurement.
 
 All the runtime/kernel tables above are on an Ampere RTX 3060. Kaggle's free
 **Tesla T4** (Turing) is the most accessible GPU for reproducing this, so these T4
@@ -317,11 +371,23 @@ On **every** model: AtlasInfer's **INT8 matches/beats** bitsandbytes' LLM.int8()
 and at **4-bit, GPTQ-NF4 is the best method** — beating bnb's NF4, plain NF4, and
 (on Qwen3-0.6B and Pythia-1.4B) even AtlasInfer's own 5-bit mixed precision, at
 the same 4-bit memory. The win is largest on the modern models (~3× closer to
-FP16 than bnb); even the hard Pythia-410M case improves +5.9→+3.9. (Plain bnb NF4
-is ~10–13% smaller at 4-bit because it double-quantizes its scales; the
-[`--double-quant`](#pushing-further-double-quant-awq-and-2-bit) flag narrows that
-at unchanged perplexity, with the residual being AtlasInfer's sparse FP16 outliers
-— which bnb omits and which buy the accuracy lead above.)
+FP16 than bnb); even the hard Pythia-410M case improves +5.9→+3.9.
+
+**The important caveat, since the table above is perplexity-only:** AtlasInfer's
+4-bit rows are **10–13% larger** than bnb's, because bnb double-quantizes its
+scales and omits sparse FP16 outliers entirely — and those outliers are exactly
+what buys the accuracy lead. So "beats bnb NF4" means *better perplexity at more
+memory*, a different point on the curve, not a dominating one. The
+[`--double-quant`](#pushing-further-double-quant-awq-and-2-bit) flag narrows the
+gap to ~9% at unchanged perplexity.
+
+**And note what beats what:** GPTQ-NF4 costs no extra memory, while the
+mixed-precision allocation costs 7–10%. On 3 of these 4 models GPTQ-NF4 therefore
+Pareto-dominates the allocator — better perplexity at strictly less memory. The
+allocator wins decisively only on Pythia-410M, where uniform 4-bit collapses. That
+is why `compare_baselines.py` now also measures the two **composed**
+(`gptq-mixed`): the mechanisms are orthogonal, and whether they stack is the open
+question. See [PAPER/01_go_nogo.md](PAPER/01_go_nogo.md) for the full accounting.
 Per-model detail incl. mixed-precision and symmetric-int4 rows:
 [Qwen3-0.6B](results/comparison_Qwen_Qwen3-0.6B-Base.md) ·
 [Qwen2.5-0.5B](results/comparison_Qwen_Qwen2.5-0.5B.md) ·

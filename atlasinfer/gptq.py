@@ -19,8 +19,10 @@ import gc
 import torch
 import torch.nn as nn
 
+from typing import Dict, Optional
+
 from .quantizer import NF4_LEVELS, QuantizedTensor4bit, quantize_tensor_nf4, _find_outliers
-from .linear import QuantizedLinear4bit, _conv1d_to_linear
+from .linear import QuantizedLinear4bit, _conv1d_to_linear, create_quantized_linear
 from .patcher import _collect_targets, DEFAULT_EXCLUDE
 from .sensitivity import SensitivityProfiler
 from .double_quant import double_quantize
@@ -200,9 +202,10 @@ def quantize_model_gptq(
     hessian_budget_gb: float = 4.0,
     exclude_patterns=None,
     double_quant: bool = False,
+    allocation: Optional[Dict[str, str]] = None,
     verbose: bool = True,
 ) -> nn.Module:
-    """Quantize all eligible linear layers to NF4 with GPTQ error compensation.
+    """Quantize eligible linear layers to NF4 with GPTQ error compensation.
 
     Layers are processed in memory-bounded *chunks*: the Hessians for a chunk are
     accumulated, those layers quantized and replaced, then the Hessians freed
@@ -213,6 +216,23 @@ def quantize_model_gptq(
 
     GPTQ is data-hungry: a rank-deficient Hessian gives unreliable compensation,
     so use many, longer calibration sequences (``nsamples`` x ``seqlen``).
+
+    Args:
+        allocation: optional ``layer_name -> precision`` map from the allocator
+            (see ``allocator.allocate_optimal``). This **composes GPTQ with
+            mixed precision**: layers assigned ``"fp16"`` are left dense,
+            ``"int8"`` layers go through the ordinary block-wise INT8 quantizer,
+            and only ``"int4"`` layers get GPTQ-NF4. The two mechanisms are
+            orthogonal — GPTQ compensates the residual error of a given
+            bit-width, the allocator chooses which bit-width — so they are
+            expected to stack. ``None`` (the default) reproduces the previous
+            behaviour: GPTQ-NF4 on every eligible layer.
+
+            Ordering matters and is deliberate: the INT8 layers are quantized
+            *before* the GPTQ pass, so the Hessians measured for the INT4 layers
+            see an already-quantized INT8 context. That matches what actually
+            runs at inference, and preserves the sequential-GPTQ property the
+            chunking was built for.
     """
     exclude_patterns = list(exclude_patterns or DEFAULT_EXCLUDE)
     all_targets = _collect_targets(model, exclude_patterns)
@@ -220,6 +240,33 @@ def quantize_model_gptq(
     batches = SensitivityProfiler(max_samples=nsamples, seq_len=seqlen)._build_calibration_batches(
         model, tokenizer, calibration_texts
     )
+
+    # Split by the allocation before anything expensive happens: layers that are
+    # not getting GPTQ must not consume Hessian budget or chunk slots.
+    n_fp16 = n_int8 = 0
+    if allocation:
+        gptq_targets = []
+        for t in all_targets:
+            parent, attr, module, name = t
+            precision = allocation.get(name, "int4").lower()
+            precision = {"fp8": "int8", "fp4": "int4"}.get(precision, precision)
+            if precision == "fp16":
+                n_fp16 += 1
+                continue
+            if precision == "int8":
+                mdev = next(module.parameters()).device
+                setattr(parent, attr,
+                        create_quantized_linear(module, precision="int8").to(mdev))
+                n_int8 += 1
+                continue
+            gptq_targets.append(t)
+        all_targets = gptq_targets
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if verbose:
+            print(f"GPTQ (mixed): {n_fp16} layers left FP16, {n_int8} quantized INT8, "
+                  f"{len(all_targets)} to GPTQ-NF4.")
 
     # Greedily pack layers into chunks under the Hessian memory budget
     # (H is in_features^2 * 4 bytes).
@@ -275,6 +322,7 @@ def quantize_model_gptq(
             print(f"  chunk {ci + 1}/{len(chunks)} done ({len(chunk)} layers)")
 
     if verbose:
+        mixed = (f" | mixed: {n_fp16} FP16, {n_int8} INT8" if allocation else "")
         print(f"GPTQ NF4 quantization complete: {n_gptq} layers compensated, "
-              f"{n_fallback} fell back to plain NF4.")
+              f"{n_fallback} fell back to plain NF4.{mixed}")
     return model

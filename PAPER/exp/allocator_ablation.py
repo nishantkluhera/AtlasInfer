@@ -153,8 +153,12 @@ def main():
                 {"counts": a.counts, "alloc_bytes": a.total_bytes,
                  "predicted_error": a.predicted_error})
 
-        g = allocate_greedy(sens, sizes, budget)
-        measure("greedy-sensitivity", bits,
+        # Benefit-per-byte greedy, given the SAME measured per-precision errors the
+        # DP optimizes. This is the MCKP LP-relaxation heuristic (within one item
+        # of optimal), so it is the honest baseline -- the earlier
+        # sensitivity-ordered greedy was a straw man. See PAPER/01_go_nogo.md 2d.
+        g = allocate_greedy(sens, sizes, budget, profiles=profiles)
+        measure("greedy-benefit-per-byte", bits,
                 quantize_model_mixed(load(), allocation=g.allocations, verbose=False),
                 {"counts": g.counts, "alloc_bytes": g.total_bytes})
 

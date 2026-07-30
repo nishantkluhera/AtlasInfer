@@ -13,6 +13,7 @@ at batch-1 decode, approach or beat (1) because it streams half the weight bytes
     ~/atlasvenv/bin/python /mnt/c/.../AtlasInfer/bench_triton_kernel.py
 """
 import importlib.util
+import json
 import os
 import time
 
@@ -43,11 +44,20 @@ def bench(fn, iters=300, warmup=50):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default="results")
+    ap.add_argument("--peak-bw", type=float, default=None,
+                    help="theoretical peak HBM bandwidth in GB/s; enables the "
+                         "bandwidth-efficiency columns (RTX 3060 Laptop = 288)")
+    args = ap.parse_args()
+
     assert torch.cuda.is_available(), "need CUDA"
     assert tk.HAS_TRITON, "Triton not available"
     dev = "cuda"
     torch.manual_seed(0)
-    print(f"GPU: {torch.cuda.get_device_name(0)}  torch {torch.__version__}\n")
+    gpu = torch.cuda.get_device_name(0)
+    print(f"GPU: {gpu}  torch {torch.__version__}\n")
 
     # (M, K, N): M=1/4 are decode; larger M are prefill-ish.
     shapes = [
@@ -58,9 +68,16 @@ def main():
         (16, 4096, 4096),
     ]
 
+    # Speedup alone flatters a low-bit kernel: at batch-1 the matmul is bound by
+    # weight streaming, so int8 gets 2x and int4 gets 4x essentially for free.
+    # What actually says whether the kernel is any good is the fraction of that
+    # headroom it captures -- reported here as achieved GB/s and as a percentage
+    # of the ideal speedup. See PAPER/01_go_nogo.md 2c.
+    rows = []
     print(f"{'shape (M,K,N)':>20} | {'fp16':>8} | {'w8a16':>8} | {'w4a16':>8} | "
-          f"{'w8/fp16':>8} | {'w4/fp16':>8} | {'w8 err':>7} | {'w4 err':>7}")
-    print("-" * 96)
+          f"{'w8/fp16':>8} | {'w4/fp16':>8} | {'w8 eff':>7} | {'w4 eff':>7} | "
+          f"{'w8 err':>7} | {'w4 err':>7}")
+    print("-" * 118)
     for (M, K, N) in shapes:
         x = torch.randn(M, K, device=dev, dtype=torch.float16)
         W = torch.randn(N, K, device=dev, dtype=torch.float16) * 0.05
@@ -83,8 +100,50 @@ def main():
         t_fp16 = bench(f_fp16)
         t_w8 = bench(f_w8)
         t_w4 = bench(f_w4)
+
+        # Weight bytes streamed per call, and the bandwidth that implies.
+        wb16 = K * N * 2
+        bw16, bw8, bw4 = (wb16 / (t_fp16 * 1e-3) / 1e9,
+                          (wb16 / 2) / (t_w8 * 1e-3) / 1e9,
+                          (wb16 / 4) / (t_w4 * 1e-3) / 1e9)
+        # Fraction of the ideal (bandwidth-bound) speedup actually captured.
+        eff8, eff4 = (t_fp16 / t_w8) / 2.0, (t_fp16 / t_w4) / 4.0
+
         print(f"{str((M,K,N)):>20} | {t_fp16:8.4f} | {t_w8:8.4f} | {t_w4:8.4f} | "
-              f"{t_fp16/t_w8:7.2f}x | {t_fp16/t_w4:7.2f}x | {e8:7.4f} | {e4:7.4f}")
+              f"{t_fp16/t_w8:7.2f}x | {t_fp16/t_w4:7.2f}x | {eff8*100:6.1f}% | "
+              f"{eff4*100:6.1f}% | {e8:7.4f} | {e4:7.4f}")
+        rows.append({
+            "M": M, "K": K, "N": N,
+            "ms_fp16": t_fp16, "ms_w8a16": t_w8, "ms_w4a16": t_w4,
+            "speedup_w8": t_fp16 / t_w8, "speedup_w4": t_fp16 / t_w4,
+            "ideal_speedup_w8": 2.0, "ideal_speedup_w4": 4.0,
+            "efficiency_w8": eff8, "efficiency_w4": eff4,
+            "gbps_fp16": bw16, "gbps_w8a16": bw8, "gbps_w4a16": bw4,
+            "rel_err_w8": e8, "rel_err_w4": e4,
+        })
+
+    if args.peak_bw:
+        best = max(r["gbps_fp16"] for r in rows)
+        print(f"\nfp16 baseline peaks at {best:.1f} GB/s = "
+              f"{best/args.peak_bw*100:.0f}% of the stated {args.peak_bw:.0f} GB/s "
+              f"-- a competent baseline, not a straw man.")
+
+    os.makedirs(args.out, exist_ok=True)
+    safe = gpu.replace(" ", "_").replace("/", "_")
+    payload = {
+        "gpu": gpu,
+        "torch": torch.__version__,
+        "triton": getattr(getattr(tk, "triton", None), "__version__", "unknown"),
+        "peak_bw_gbps": args.peak_bw,
+        "iters": 300, "warmup": 50, "timing": "best-of-3 windows",
+        "note": ("Synthetic torch.randn matrices, single GEMM. This is NOT "
+                 "end-to-end decode -- see results/latency_*.json for that."),
+        "rows": rows,
+    }
+    path = os.path.join(args.out, f"triton_kernel_{safe}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"\nWrote {path}")
 
 
 if __name__ == "__main__":

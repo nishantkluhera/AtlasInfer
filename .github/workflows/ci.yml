@@ -34,5 +34,17 @@ jobs:
       - name: Import smoke test (harness modules load without a GPU)
         run: python -c "import atlasinfer, benchmark, compare_baselines, eval_downstream, reproduce; print('imports OK')"
 
+      # -rs prints the reason for every skip. The GitHub runner is CPU-only, so
+      # the Triton/CUDA kernel tests skip here — that is expected, but it must be
+      # VISIBLE. A green check on a suite that silently skipped the kernel
+      # correctness tests reads as "kernels verified" when nothing was verified.
       - name: Run tests
-        run: pytest tests/ -v
+        run: pytest tests/ -v -rs
+
+      - name: Report untested-on-CI surface
+        if: always()
+        run: |
+          echo "::warning::CI runs CPU-only. Triton W8A16/W4A16 kernel correctness"
+          echo "::warning::tests are SKIPPED here and must be run on a CUDA host:"
+          echo "::warning::  pytest tests/test_triton_kernels.py -v"
+          echo "::warning::See docs/wsl_triton.md for the WSL2 setup."

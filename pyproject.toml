@@ -16,24 +16,38 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+# Version floors AND ceilings. The ceilings are not cosmetic: a paid cloud run
+# that dies on a dependency bump costs real money and hours, and this project's
+# most expensive failure mode to date has been environment breakage, not code
+# bugs. Two specific hazards these guard against:
+#   * numpy 2.x alongside scipy/sklearn built for 1.x -> `import transformers`
+#     fails with "numpy.core.multiarray failed to import", killing every harness
+#     (see docs/lightning_7b.md "Gotchas" and run_lightning.sh setup()).
+#   * transformers majors move fast and periodically break the quantization
+#     config plumbing the external baselines dispatch through.
+# Loosen deliberately, after testing -- not by default.
 dependencies = [
-    "torch>=2.0.0",
-    "numpy",
-    "transformers>=4.30.0",
-    "accelerate>=0.20.0",
-    "safetensors",
+    "torch>=2.4,<2.9",
+    "numpy>=1.24,<3",
+    "transformers>=4.40,<6",
+    "accelerate>=0.26,<2",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
-benchmark = ["datasets", "matplotlib"]
-dev = ["pytest>=7.0.0"]
-kernel = ["triton>=3.0"]  # fused W8A16 kernel; Linux/WSL2 only
+benchmark = ["datasets>=2.16,<5", "matplotlib>=3.7,<4"]
+dev = ["pytest>=7.0.0,<10"]
+kernel = ["triton>=3.0,<4"]  # fused W8A16 kernel; Linux/WSL2 only
 # External quant baselines for compare_baselines.py (Linux/CUDA only, version-
 # fragile — the harness skips any that fail to import). gptqmodel is the
 # maintained GPTQ backend transformers' GPTQConfig dispatches to.
+# Left UNPINNED on purpose: these are the packages most likely to conflict with
+# whatever torch/transformers the cloud image ships, and compare_baselines.py
+# already degrades gracefully to a SKIP when one fails to import. Pinning them
+# would turn a skipped row into a failed install of the whole extra.
 baselines = ["bitsandbytes", "optimum", "gptqmodel", "autoawq"]
 # Downstream zero-shot accuracy (eval_downstream.py).
-eval = ["lm-eval>=0.4.0"]
+eval = ["lm-eval>=0.4.0,<0.6"]
 
 [project.scripts]
 atlasinfer = "atlasinfer.inference:main"
