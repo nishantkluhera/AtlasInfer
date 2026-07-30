@@ -180,6 +180,12 @@ Two things this table does **not** say, both worth knowing up front:
   upgrade some subset of layers to INT8. Measured against a *random* such subset
   at matched memory, the allocator wins by 16–43%
   ([ablation](PAPER/exp/results/ablation_Qwen_Qwen2.5-0.5B.json)).
+- **The exact knapsack solve is not what's doing the work.** In that same
+  ablation, a plain benefit-per-byte greedy matches the DP to within 0.006 ppl on
+  average — **7.5× inside the run-to-run spread** — and beats it at 2 of 4
+  budgets. What buys the 16–43% is the *measured sensitivity signal*, not solving
+  the multiple-choice knapsack optimally. Reported because it's the kind of thing
+  that's easy to leave unmeasured and quietly overclaim.
 - **GPTQ-NF4 does better still, at the *same* 4-bit footprint** (+0.48 vs +0.53)
   and at zero extra memory — see [vs bitsandbytes](#vs-bitsandbytes). On 3 of 4
   models GPTQ-NF4 beats mixed precision outright. The two mechanisms are

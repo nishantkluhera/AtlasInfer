@@ -386,7 +386,7 @@ and needs code. It is also pre-empted (APTQ, oQ+).
 | K2 | Cross-family generality | PASS — holds on Qwen, Pythia/NeoX, GPT-2 |
 | K3 | Iso-memory survival | **PASS** — 16–43% over achievable baselines (1 model measured) |
 | K4 | Not dominated by known baseline | **UNRESOLVED** — GPTQ dominates 3/4; composition unimplemented *and* pre-empted |
-| K5 | Attribution to the knapsack | **PARTIAL** — signal real; *exact DP* untested vs. competent greedy and theoretically unnecessary |
+| K5 | Attribution to the knapsack | **FAIL** (revised in §2f after testing against a competent greedy) — the sensitivity signal is worth 16–43%, but the exact DP is within noise of a simple greedy |
 | K6 | Kernel contribution | **FAIL** — W4A16 at 26–68% of available bandwidth; 1.04× at M=16 vs Marlin's ~4×; no quantized-kernel comparison; e2e decode slower than FP16 |
 | K7 | Scale credibility | **FAIL** — no ≥7B; 6 GB local cannot even load 7B FP16 |
 
@@ -503,18 +503,37 @@ GPT-2 is the oldest and most forgiving architecture here. This needs to replicat
 at 7B and on ≥2 other families before it is load-bearing. **It is now the first
 thing the Lightning credits should buy.**
 
-### K5 — WEAKER. The fixed greedy beats the DP.
+### K5 — FAILS. The exact DP is indistinguishable from a simple greedy.
 
-With `allocate_greedy` replaced by a proper benefit-per-byte greedy (given the
-same measured per-precision errors the DP optimizes), the same preflight shows
-**greedy 21.847 vs knapsack DP 21.952 at identical memory** — the heuristic *wins*.
+The full ablation was re-run on Qwen2.5-0.5B with `allocate_greedy` replaced by a
+benefit-per-byte greedy, given the *same* measured per-precision errors the DP
+optimizes (30k eval tokens, 168 profiled layers;
+`PAPER/exp/results/ablation_Qwen_Qwen2.5-0.5B.json`):
 
-This is what MCKP theory predicts (the LP-relaxation greedy is within one item of
-optimal) and it confirms §2d's suspicion. It also means the earlier 8.6–33.2%
-"DP beats greedy" margins were entirely an artifact of the broken baseline. The
-allocation *signal* still beats random decisively; the *exact DP* does not earn
-its keep. A full re-run of the ablation on Qwen2.5-0.5B with the fixed greedy is
-in flight.
+| target bits | knapsack DP | greedy (benefit/byte) | random (mean, n=3) | DP − greedy | random-seed spread | **DP vs random** |
+| ---: | --- | --- | ---: | ---: | ---: | ---: |
+| 4.25 | 12.5392 @ 492.6 MB | 12.5423 @ 492.6 | 12.6586 | +0.0031 | 0.0312 | 15.9% |
+| 4.5 | 12.4283 @ 502.9 MB | 12.4433 @ **501.3** | 12.6421 | +0.0150 | 0.0153 | 29.1% |
+| 5.0 | 12.3660 @ 518.6 MB | **12.3628** @ 518.5 | 12.6141 | −0.0032 | 0.0427 | 35.1% |
+| 6.0 | 12.2668 @ 553.8 MB | **12.2653** @ 554.2 | 12.5349 | −0.0016 | 0.0834 | 42.7% |
+
+**The DP and the greedy are the same allocator, empirically.** Mean |difference|
+is **0.0057 ppl** (max 0.0150) — **7.5× smaller than the spread across random
+allocations at the same budget**, i.e. far inside the noise floor. Greedy wins
+outright at 2 of 4 budgets, and at 4.5 bits it reaches near-identical perplexity
+using *less* memory.
+
+Both crush random by 15.9–42.7%. So the finding splits cleanly:
+
+- **The sensitivity signal is real and large.** Choosing *which* layers to
+  upgrade, using measured ΔNLL, is worth 16–43% of the perplexity penalty.
+- **The exact multiple-choice-knapsack solve contributes nothing measurable.**
+  This is what MCKP theory predicts — the LP-relaxation greedy is provably within
+  one item of optimal — and it is now confirmed on a real model at four budgets.
+
+The earlier 8.6–33.2% "DP beats greedy" margins in §2d were **entirely an
+artifact of the straw-man baseline** and should be disregarded. K5's kill
+condition ("fails to beat greedy by more than run-to-run noise") is met.
 
 ### Effect on the verdict: **unchanged — still Option 3.**
 
