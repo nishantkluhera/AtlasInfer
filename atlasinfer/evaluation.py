@@ -30,6 +30,7 @@ _CALIB_MAX_DOCS = 256
 def model_weight_bytes(model: torch.nn.Module) -> int:
     """Resident weight footprint: quantized buffers + remaining dense params."""
     from .linear import QuantizedLinear, QuantizedLinear3bit, QuantizedLinear4bit
+    from .triton_kernels import W4A16Linear, W8A16Linear
 
     total = sum(p.numel() * p.element_size() for p in model.parameters())
     for module in model.modules():
@@ -44,6 +45,13 @@ def model_weight_bytes(model: torch.nn.Module) -> int:
             in_scale = getattr(module, "in_scale", None)
             if in_scale is not None:
                 total += in_scale.numel() * in_scale.element_size()
+        elif isinstance(module, (W8A16Linear, W4A16Linear)):
+            # Kernel layers store their packed weight, scale AND bias as buffers,
+            # so model.parameters() misses all three; memory_bytes() counts them.
+            # Without this branch a kernel-quantized model reports only its dense
+            # params (0 for the transformer blocks) and disagrees with both
+            # resident_bytes() and offload.estimate_model_memory().
+            total += module.memory_bytes()
     return total
 
 

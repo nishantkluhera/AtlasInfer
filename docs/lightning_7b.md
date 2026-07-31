@@ -62,7 +62,7 @@ these rev fast and some are gated.
 | Falcon | `tiiuae/Falcon3-7B-Base` | open | dense |
 | DeepSeek | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` | open | ⚠️ **Qwen arch underneath** — DeepSeek *data*, not DeepSeek *architecture*. True DeepSeek arch (V2/V3 MoE) is 236B–671B, out of budget. Their own dense `deepseek-llm-7b-base` is 2023. |
 | OpenAI gpt-oss | `openai/gpt-oss-20b` | open | **MoE** — genuinely different arch class |
-| Alibaba Qwen (latest) | `Qwen/Qwen3.5-9B-Base` | open | **hybrid** Gated-Delta + MoE (see caveat) |
+| Alibaba Qwen (newest) | `Qwen/Qwen3.5-9B-Base` (or the `Qwen3.6` series) | open | **hybrid** Gated-Delta + MoE (see caveat) — for a dense Qwen use `Qwen3-8B-Base` above |
 | field-standard | `meta-llama/Llama-2-7b-hf` | gated | what QuIP#/AQLM/GPTQ report on |
 
 **Recommended subset for ~15 credits** (maximum architectural spread, mostly

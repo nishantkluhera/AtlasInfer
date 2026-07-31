@@ -45,11 +45,11 @@ python bench_triton_kernel.py --peak-bw 336   # 336 GB/s = RTX 3060 Laptop (192-
 
 Writes `results/triton_kernel_<gpu>.json`. Check:
 
-- the **fp16 baseline** reaches a sane fraction of the card's peak bandwidth (it
-  printed 85-89% on the 3060). A low number means the baseline is broken and every
-  speedup is inflated.
+- the **fp16 baseline** reaches a sane fraction of the card's peak bandwidth (the
+  committed run printed 313 GB/s = 93% of the 3060's 336 GB/s peak). A low number
+  means the baseline is broken and every speedup is inflated.
 - **efficiency columns**, not just speedup. W8A16 should be near 100% of its
-  ideal 2×; W4A16 has historically managed only 26–68% of its ideal 4×.
+  ideal 2×; W4A16 has historically managed only 27–66% of its ideal 4×.
 
 ## 4. End-to-end engine smoke (required)
 
@@ -89,7 +89,7 @@ transformers 5.12.0, bitsandbytes 0.49.2, venv at `~/atlasvenv`.
 | 5. Latency | **pass**, but see the variance warning below |
 
 - **W8A16 is the real result**: 1.96× of an ideal 2.0× (98% efficiency) at
-  (1, 4096, 11008), and accuracy costs only +0.019 ppl. Usable.
+  (1, 4096, 11008), and accuracy costs only +0.017 ppl. Usable.
 - **W4A16 is not**: 1.12–2.66× where 4× is available (28–67% efficiency), **and
   the per-channel int4 format costs +14.39 perplexity**. See
   [tech_debt.md](tech_debt.md) #6.

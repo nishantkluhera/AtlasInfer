@@ -1,9 +1,11 @@
 # Benchmarks
 
 Every number here is generated, not transcribed: each table's source is a
-`.json` under [`results/`](../results/), and `tests/test_readme_consistency.py`
-fails CI if a table drifts from its source file. Two tables are explicitly
-marked as lacking committed source data — they say so inline.
+generated file under [`results/`](../results/) — a `.json` for the perplexity
+tables, a `.md` written by `compare_baselines.py` for the vs-bitsandbytes table —
+and `tests/test_readme_consistency.py` fails CI if a table drifts from its source
+file. Two tables are explicitly marked as lacking committed source data — they say
+so inline.
 
 Paths in this file are relative to the repository root.
 
@@ -156,22 +158,25 @@ The kernels use **per-output-channel symmetric** int8/int4 — *not* the block-w
 NF4 + sparse-outlier format every other perplexity number on this page was
 measured with. So the speed table above and the accuracy tables above describe
 **different quantizers**. Measuring both on one model
-(`PAPER/exp/kernel_format_accuracy.py`, Qwen2.5-0.5B, WikiText-2, 30k tokens):
+(`PAPER/exp/kernel_format_accuracy.py`, Qwen2.5-0.5B, WikiText-2, 30k tokens — so
+the FP16 anchor here is 11.906, versus 12.279 in the per-model table above, which
+uses 40k tokens; absolute perplexity shifts with the token budget while the
+*deltas* that the comparison turns on do not):
 
 | Config | format | ~bits | MB | Perplexity | Δ vs FP16 |
 | --- | --- | ---: | ---: | ---: | ---: |
 | fp16 | dense | 16 | 942.3 | 11.906 | +0.000 |
 | eager int8 (block+outlier) | eager | 8 | 620.9 | 11.911 | +0.005 |
-| **kernel W8A16 (per-channel)** | kernel | 8 | 601.6 | 11.925 | **+0.019** |
+| **kernel W8A16 (per-channel)** | kernel | 8 | 601.6 | 11.924 | **+0.017** |
 | eager nf4 (block+outlier) | eager | 4 | 484.1 | 12.679 | +0.773 |
-| **kernel W4A16 (per-channel)** | kernel | 4 | 431.0 | 26.296 | **+14.389** |
+| **kernel W4A16 (per-channel)** | kernel | 4 | 431.0 | 26.299 | **+14.393** |
 
-**W8A16 is fine** — +0.019 is essentially lossless, so the INT8 kernel is a real,
-usable speedup: 1.95× on a batch-1 GEMM at no meaningful accuracy cost.
+**W8A16 is fine** — +0.017 is essentially lossless, so the INT8 kernel is a real,
+usable speedup: 1.97× on the largest batch-1 GEMM at no meaningful accuracy cost.
 
 **W4A16 is not usable.** Per-channel symmetric int4 with no blocks, no outlier
 handling and no codebook more than doubles perplexity. You would never deploy it,
-which means its 1.78–2.74× batch-1 speedup is not a speedup of anything you'd
+which means its 1.45–2.62× batch-1 speedup is not a speedup of anything you'd
 actually run. Reported rather than quietly dropped, because the number was
 previously unmeasured and the speed table on its own reads as though it were free.
 

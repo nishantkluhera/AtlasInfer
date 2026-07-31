@@ -22,7 +22,7 @@ Methods:
 Run under Linux/WSL2 + CUDA:
     pip install -e ".[eval]"
     python eval_downstream.py --model Qwen/Qwen2.5-0.5B --limit 500
-    python eval_downstream.py --model Qwen/Qwen2.5-7B --device-map --tasks arc_easy piqa
+    python eval_downstream.py --model Qwen/Qwen3-8B-Base --device-map --tasks arc_easy piqa
 """
 import argparse
 import gc

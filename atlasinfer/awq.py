@@ -83,12 +83,13 @@ def search_awq_scale(
     W: torch.Tensor, act_absmean: torch.Tensor, x_rows: torch.Tensor,
     alphas: Sequence[float] = DEFAULT_ALPHAS,
     block_size: int = 64, outlier_threshold: float = 2.5,
+    double_quant: bool = False,
 ) -> torch.Tensor:
     """Grid-search the per-input-channel AWQ scale that minimizes NF4 output MSE.
 
-    ``block_size``/``outlier_threshold`` must match what the layer will actually
-    be quantized with, or the search optimizes alpha against a different grid
-    than the one deployed and can pick a worse scale.
+    ``block_size``/``outlier_threshold``/``double_quant`` must match what the
+    layer will actually be quantized with, or the search optimizes alpha against
+    a different grid than the one deployed and can pick a worse scale.
 
     Args:
         W: (out_features, in_features) float weight, on the compute device.
@@ -115,6 +116,7 @@ def search_awq_scale(
         # once per alpha per layer -- thousands of transfers over a whole model.)
         qWs = dequantize_tensor_nf4(quantize_tensor_nf4(
             Ws, block_size=block_size, outlier_threshold=outlier_threshold,
+            double_quant=double_quant,
         )).to(dev).to(W.dtype)
         out = (x / s) @ qWs.t()
         err = (out - ref).pow(2).mean() / ref_norm
@@ -165,7 +167,7 @@ def quantize_model_awq(
         if name in stats and W.shape[1] % block_size == 0:
             act_absmean, x_rows = stats[name]
             s = search_awq_scale(W.to(ldev), act_absmean, x_rows, alphas,
-                                 block_size=block_size)
+                                 block_size=block_size, double_quant=double_quant)
             Ws = (W.to(ldev) * s.unsqueeze(0))
             qt = quantize_tensor_nf4(Ws, block_size=block_size, double_quant=double_quant)
             layer = QuantizedLinear4bit(

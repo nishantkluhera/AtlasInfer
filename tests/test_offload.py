@@ -171,6 +171,53 @@ class TestMemoryEstimate:
         small = estimate_model_memory(nn.Linear(128, 128).half())["total_gb"]
         assert big > small
 
+    def test_counts_three_bit_layers(self):
+        """Regression: the estimator must include the 3-bit (NF3) tier.
+
+        A mixed-precision allocation can assign layers to QuantizedLinear3bit; if
+        the estimator skips that type it silently undercounts every 3-bit layer
+        (the engine then prints a too-low "Model memory"). model_weight_bytes
+        already counts them, so the two accountings must not disagree.
+        """
+        from atlasinfer.linear import QuantizedLinear3bit, create_quantized_linear
+        layer = create_quantized_linear(nn.Linear(256, 256), precision="int3")
+        assert isinstance(layer, QuantizedLinear3bit)
+        expected = layer.quantized_weights.memory_bytes()
+        if layer.bias is not None:
+            expected += layer.bias.numel() * layer.bias.element_size()
+        info = estimate_model_memory(layer)
+        assert info["quantized_bytes"] == expected > 0
+        assert info["dense_bytes"] == 0
+
+
+class TestKernelLayerMemoryAccounting:
+    """`model_weight_bytes` must count W8A16/W4A16 kernel layers.
+
+    Regression: those layers store packed weight, scale and bias as *buffers*
+    (not params), so `sum(model.parameters())` misses them; before the fix
+    `model_weight_bytes` returned 0 for a kernel-quantized block and silently
+    disagreed with both `resident_bytes` and `estimate_model_memory`.
+    """
+
+    def test_model_weight_bytes_counts_kernel_layers(self):
+        from atlasinfer.evaluation import model_weight_bytes, resident_bytes
+        from atlasinfer.triton_kernels import W4A16Linear, W8A16Linear
+        model = nn.Sequential(
+            W8A16Linear.from_linear(nn.Linear(256, 256)),
+            W4A16Linear.from_linear(nn.Linear(256, 128)),
+        )
+        mwb = model_weight_bytes(model)
+        assert mwb > 0
+        # These layers hold no plain params, so the "params + quantized buffers"
+        # rule must match resident_bytes' "params + all buffers".
+        assert mwb == resident_bytes(model)
+
+    def test_model_weight_bytes_agrees_with_estimate_on_kernel_model(self):
+        from atlasinfer.evaluation import model_weight_bytes
+        from atlasinfer.triton_kernels import W8A16Linear
+        model = nn.Sequential(W8A16Linear.from_linear(nn.Linear(256, 256)))
+        assert estimate_model_memory(model)["quantized_bytes"] == model_weight_bytes(model)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

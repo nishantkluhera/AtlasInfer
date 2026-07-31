@@ -105,7 +105,14 @@ def _layer_bytes(param_count: int, precision: str) -> int:
 def allocate_optimal(
     profiles: Dict[str, "object"],
     budget_bytes: int,
-    precisions: List[str] = ("fp16", "int8", "int4", "int3"),
+    # int3 is deliberately NOT a default tier. The iso-memory experiment showed a
+    # mixed allocation that reaches for 3-bit LOSES to uniform NF4 at equal memory
+    # (PAPER/exp/iso_memory.py), because the profiled int3 error understates its
+    # true perplexity cost, so the DP over-demotes to it. Left in the defaults it
+    # silently degraded every mixed-precision result (benchmark/compare/downstream)
+    # and the AtlasInference product path. Pass precisions=(..., "int3") explicitly
+    # to opt in, as iso_memory.py does.
+    precisions: List[str] = ("fp16", "int8", "int4"),
     num_buckets: int = 4096,
 ) -> AllocationResult:
     """Minimum-error precision assignment within a byte budget.
@@ -241,7 +248,8 @@ def allocate_greedy(
     sensitivities: Dict[str, float],
     layer_sizes: Dict[str, int],
     budget_bytes: int,
-    precisions: List[str] = ("fp16", "int8", "int4", "int3"),
+    # int3 is opt-in, not a default tier — see the note in ``allocate_optimal``.
+    precisions: List[str] = ("fp16", "int8", "int4"),
     profiles: Optional[Dict[str, "object"]] = None,
 ) -> AllocationResult:
     """Baseline allocator: the classic **benefit-per-byte** greedy for a
@@ -378,7 +386,7 @@ def print_allocation_report(
     print(f"Allocated: {result.total_bytes / 1024**3:.3f} GB ({util:.1f}% of budget)")
     print(f"Avg bits/weight: {result.avg_bits:.2f}")
     print("Precision distribution:")
-    for p in ("fp16", "int8", "int4"):
+    for p in ("fp16", "int8", "int4", "int3"):
         print(f"  {p.upper():<5}: {result.counts.get(p, 0)} layers")
 
     if sensitivities:

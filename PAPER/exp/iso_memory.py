@@ -103,7 +103,9 @@ def main():
     print("\n[profiling end-to-end sensitivities once (int8/int4/int3)]")
     t0 = time.time()
     base = load().to(dev).eval()
-    profiles = SensitivityProfiler().profile_end_to_end(
+    # This is the experiment that studies the sub-4-bit tier, so it opts into int3
+    # explicitly (it is NOT a library default — see allocator.allocate_optimal).
+    profiles = SensitivityProfiler(precisions=("int8", "int4", "int3")).profile_end_to_end(
         base, tokenizer=tok, calibration_texts=calib)
     base.to("cpu"); del base; gc.collect(); torch.cuda.empty_cache()
     n_params = sum(p.param_count for p in profiles.values())
@@ -115,10 +117,12 @@ def main():
     for bits in args.bits:
         budget = int(n_params * bits / 8)
         print(f"\n[nominal {bits} bits]")
-        a = allocate_optimal(profiles, budget_bytes=budget)
+        a = allocate_optimal(profiles, budget_bytes=budget,
+                             precisions=("fp16", "int8", "int4", "int3"))
         measure(f"knapsack-{bits}", quantize_model_mixed(
             load(), allocation=a.allocations, verbose=False), bits, {"counts": a.counts})
-        g = allocate_greedy(sens, sizes, budget, profiles=profiles)
+        g = allocate_greedy(sens, sizes, budget, profiles=profiles,
+                            precisions=("fp16", "int8", "int4", "int3"))
         measure(f"greedy-{bits}", quantize_model_mixed(
             load(), allocation=g.allocations, verbose=False), bits, {"counts": g.counts})
 

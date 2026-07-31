@@ -16,8 +16,8 @@ Everything here — the block-wise integer quantizer, the calibration-based
 sensitivity profiler, and the budget allocator — is implemented from scratch on
 top of PyTorch (no `bitsandbytes`, no `auto-gptq`), so the whole pipeline is
 inspectable in a few hundred lines. There are also optional **fused W8A16/W4A16
-Triton kernels** (Linux/WSL2) that beat an FP16 `F.linear` by **1.5–1.95×** on an
-isolated batch-1 GEMM.
+Triton kernels** (Linux/WSL2) where W8A16 beats an FP16 `F.linear` by **1.5–1.97×**
+on an isolated batch-1 GEMM.
 
 > **Read that kernel number carefully — it is a single-matmul microbenchmark, not
 > decode.** End-to-end generation through the default *eager* path is
@@ -25,7 +25,7 @@ isolated batch-1 GEMM.
 > AtlasInfer buys **memory**, and the fused kernels claw back matmul time in
 > isolation. End-to-end decode with the fused kernels has not been measured.
 > A fuller accounting of what these kernels do and don't achieve — including the
-> fact that W4A16 captures only 26–68% of the bandwidth headroom a 4-bit weight
+> fact that W4A16 captures only 27–66% of the bandwidth headroom a 4-bit weight
 > makes available — is in [PAPER/01_go_nogo.md](PAPER/01_go_nogo.md#2c).
 
 ---
@@ -242,8 +242,8 @@ don't install on the Windows dev box) — use a cloud GPU:
   baseline; **`--device-map`** shards across both T4s for 7–13B:
 
 ```bash
-python benchmark.py        --model Qwen/Qwen3.5-9B-Base --device-map
-python compare_baselines.py --model Qwen/Qwen3.5-9B-Base --device-map
+python benchmark.py        --model Qwen/Qwen3-8B-Base --device-map
+python compare_baselines.py --model Qwen/Qwen3-8B-Base --device-map
 ```
 
 Two changes make this practical: GPTQ now uses a **block-batched** column update
@@ -284,8 +284,10 @@ docs/wsl_triton.md   # WSL2 setup for the Triton kernel
 
 - **Two paths, by precision.** The default eager path dequantizes weights to
   FP16 per `matmul` — a memory win at a latency cost (runtime table above). The
-  **fused Triton W8A16 kernel** removes that cost and is *faster* than FP16 at
-  batch-1 decode (kernel table above), but it's Linux/GPU-only (WSL2 on Windows).
+  **fused Triton W8A16 kernel** removes that cost and is *faster* than FP16 on a
+  batch-1 GEMM (kernel table above — a single-matmul microbenchmark, not an
+  end-to-end decode step, which has not been measured), but it's Linux/GPU-only
+  (WSL2 on Windows).
   A note on what *doesn't* work: the obvious shortcut — INT8×INT8 GEMM via
   `torch._int_mm` (W8A8) — measured *slower* than FP16 on this consumer Ampere
   card once activation quant/dequant overhead is counted, and can't do batch-1
@@ -326,8 +328,9 @@ docs/wsl_triton.md   # WSL2 setup for the Triton kernel
   ([`double_quant.py`](atlasinfer/double_quant.py), `--double-quant`) — removes the
   FP32 scale overhead at ~unchanged perplexity, narrowing the 4-bit memory gap to
   bnb.
-- **Done:** fused W8A16 **and** W4A16 Triton kernels (1.6–2.7× over FP16 at
-  batch-1 decode, WSL2/RTX 3060), wired into `AtlasInference` (`kernel="auto"`).
+- **Done:** fused W8A16 **and** W4A16 Triton kernels (1.45–2.62× over FP16 on a
+  batch-1 GEMM microbenchmark, WSL2/RTX 3060), wired into `AtlasInference`
+  (`kernel="auto"`). End-to-end decode with the kernels is not yet measured.
 - **Experimental:** 2–3 bit via a single-codebook vector quantizer
   ([`codebook.py`](atlasinfer/experimental/codebook.py)) — the direction toward the
   AQLM/QuIP#/QTIP frontier; correctness-tested, **not yet validated at scale**.

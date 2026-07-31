@@ -544,11 +544,11 @@ The kernel/eager format gap flagged in §2c has now been measured
 
 | Config | format | ~bits | MB | Perplexity | Δ vs FP16 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| fp16 | dense | 16 | 942.3 | 11.9064 | +0.0000 |
-| eager int8 (block+outlier) | eager | 8 | 620.9 | 11.9111 | +0.0047 |
-| kernel W8A16 (per-channel) | kernel | 8 | 601.6 | 11.9249 | **+0.0185** |
-| eager nf4 (block+outlier) | eager | 4 | 484.1 | 12.6793 | +0.7729 |
-| kernel W4A16 (per-channel) | kernel | 4 | 431.0 | 26.2955 | **+14.3891** |
+| fp16 | dense | 16 | 942.3 | 11.9066 | +0.0000 |
+| eager int8 (block+outlier) | eager | 8 | 620.9 | 11.9113 | +0.0047 |
+| kernel W8A16 (per-channel) | kernel | 8 | 601.6 | 11.9240 | **+0.0174** |
+| eager nf4 (block+outlier) | eager | 4 | 484.1 | 12.6795 | +0.7729 |
+| kernel W4A16 (per-channel) | kernel | 4 | 431.0 | 26.2992 | **+14.3926** |
 
 W8A16 is essentially lossless, so the INT8 kernel's 1.95×-of-an-ideal-2.0× is a
 real result. But **W4A16 more than doubles perplexity** — per-channel symmetric

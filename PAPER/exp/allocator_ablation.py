@@ -49,6 +49,22 @@ from atlasinfer.evaluation import evaluate_perplexity, load_wikitext, model_weig
 
 hf_logging.set_verbosity_error()
 
+# The tier set this ablation is about. It MUST match the tiers the `random`
+# control arm can reach (`random_allocation` walks int4 -> int8 -> fp16), or the
+# comparison is apples-to-oranges: the DP/greedy would be handed a cheaper tier
+# the baseline can't use and would spend the freed budget on it.
+#
+# This is not hypothetical. When the 3-bit `int3` tier was later added to the
+# allocator's and profiler's *defaults* (for the separate iso-memory experiment),
+# it silently leaked into the DP/greedy here but not into `random`. At a 4.25-bit
+# budget the DP then demoted ~50 layers to int3 — whose profiled ΔNLL understates
+# its true perplexity cost — and the "mixed beats random by 16-43%" result
+# INVERTED (DP lost to random). The sub-int4 story is measured honestly in
+# `iso_memory.py`; this experiment stays on {fp16, int8, int4} so its result is
+# reproducible regardless of what tiers get added to the library defaults.
+ABLATION_TIERS = ("fp16", "int8", "int4")
+ABLATION_PROFILE_TIERS = ("int8", "int4")  # fp16 is the implicit lossless anchor
+
 
 def random_allocation(profiles, budget_bytes, rng):
     """Control arm: spend the budget on a RANDOM subset of layers.
@@ -133,7 +149,7 @@ def main():
     print("\n[profiling end-to-end sensitivities once]")
     t0 = time.time()
     base = load().to(device).eval()
-    profiles = SensitivityProfiler().profile_end_to_end(
+    profiles = SensitivityProfiler(precisions=ABLATION_PROFILE_TIERS).profile_end_to_end(
         base, tokenizer=tok, calibration_texts=calib)
     base.to("cpu"); del base; gc.collect(); torch.cuda.empty_cache()
     print(f"  profiled {len(profiles)} layers in {time.time()-t0:.0f}s")
@@ -147,7 +163,7 @@ def main():
         budget = int(n_params * bits / 8)
         print(f"\n[budget {bits} bits = {budget/1024**2:.1f} MB over profiled layers]")
 
-        a = allocate_optimal(profiles, budget_bytes=budget)
+        a = allocate_optimal(profiles, budget_bytes=budget, precisions=ABLATION_TIERS)
         measure("knapsack-dp", bits,
                 quantize_model_mixed(load(), allocation=a.allocations, verbose=False),
                 {"counts": a.counts, "alloc_bytes": a.total_bytes,
@@ -157,7 +173,7 @@ def main():
         # DP optimizes. This is the MCKP LP-relaxation heuristic (within one item
         # of optimal), so it is the honest baseline -- the earlier
         # sensitivity-ordered greedy was a straw man. See PAPER/01_go_nogo.md 2d.
-        g = allocate_greedy(sens, sizes, budget, profiles=profiles)
+        g = allocate_greedy(sens, sizes, budget, profiles=profiles, precisions=ABLATION_TIERS)
         measure("greedy-benefit-per-byte", bits,
                 quantize_model_mixed(load(), allocation=g.allocations, verbose=False),
                 {"counts": g.counts, "alloc_bytes": g.total_bytes})

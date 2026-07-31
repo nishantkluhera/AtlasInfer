@@ -6,11 +6,12 @@
 #
 #   bash run_lightning.sh <stage> [MODEL]
 #     stages: setup | compare | sweep | downstream | latency | all | overnight
-#     MODEL default: Qwen/Qwen3.5-9B-Base  (latest open Qwen, Feb 2026, no gating).
-#       NOTE Qwen3.5 is a HYBRID arch (Gated Delta Networks + sparse MoE); AtlasInfer
-#       targets nn.Linear/Conv1D and is validated on DENSE transformers, so run the
-#       0.8B smoke first to confirm it quantizes cleanly. Known-dense fallback:
-#       Qwen/Qwen3-8B-Base (2025). Field-standard protocol: meta-llama/Llama-2-7b-hf
+#     MODEL default: Qwen/Qwen3-8B-Base  (dense, open, no gating -- what AtlasInfer
+#       is validated on). The newest open Qwen releases (Qwen3.5-9B-Base, and the
+#       Qwen3.6 series) are HYBRID architectures (Gated Delta Networks + sparse MoE):
+#       AtlasInfer targets nn.Linear/Conv1D and is validated on DENSE transformers,
+#       so if you point it at a hybrid/MoE model run the 0.8B smoke first to confirm
+#       it quantizes cleanly. Field-standard protocol: meta-llama/Llama-2-7b-hf
 #       (needs `huggingface-cli login` + accepting Meta's license on HF).
 #
 # UNATTENDED / OVERNIGHT -- one command, then walk away:

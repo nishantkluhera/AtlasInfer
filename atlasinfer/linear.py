@@ -419,5 +419,6 @@ def create_quantized_linear(
         )
     else:
         raise ValueError(
-            f"Unknown precision: {precision!r}. Use 'fp16', 'int8', or 'int4'."
+            f"Unknown precision: {precision!r}. "
+            f"Use 'fp16', 'int8', 'int4', or 'int3' (aliases: 'nf3'/'fp4'/'fp8')."
         )

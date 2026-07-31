@@ -21,7 +21,10 @@ from .quantizer import (
     quantize_tensor_nf4, dequantize_tensor_nf4, NF4_LEVELS,
     compression_ratio,
 )
-from .linear import QuantizedLinear, QuantizedLinear4bit, create_quantized_linear
+from .linear import (
+    QuantizedLinear, QuantizedLinear3bit, QuantizedLinear4bit,
+    create_quantized_linear,
+)
 from .patcher import quantize_model, quantize_model_mixed, get_model_info
 from .offload import setup_cpu_offload, CPUOffloadHook, estimate_model_memory
 from .sensitivity import (
@@ -52,7 +55,8 @@ __all__ = [
     "quantize_tensor_nf4", "dequantize_tensor_nf4", "NF4_LEVELS",
     "compression_ratio",
     # Layers
-    "QuantizedLinear", "QuantizedLinear4bit", "create_quantized_linear",
+    "QuantizedLinear", "QuantizedLinear3bit", "QuantizedLinear4bit",
+    "create_quantized_linear",
     # Patching
     "quantize_model", "quantize_model_mixed", "get_model_info",
     # Offloading
@@ -63,7 +67,6 @@ __all__ = [
     "PrecisionLevel", "AllocationResult", "get_layer_sizes",
     "allocate_optimal", "allocate_greedy", "uniform_allocation",
     "QuantizedTensor3bit", "quantize_tensor_nf3", "dequantize_tensor_nf3",
-    "QuantizedLinear3bit",
     "estimate_memory_usage", "print_allocation_report",
     # Fused kernel
     "HAS_TRITON", "kernel_available", "W8A16Linear", "W4A16Linear",

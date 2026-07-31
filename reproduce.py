@@ -9,7 +9,7 @@ is fully released between runs. Everything lands under results/.
     python reproduce.py                                  # cross-family small suite
     python reproduce.py --readme                         # exactly the README's models
     python reproduce.py --models Qwen/Qwen2.5-0.5B gpt2  # pick models
-    python reproduce.py --models Qwen/Qwen2.5-7B --device-map --stages benchmark
+    python reproduce.py --models Qwen/Qwen3-8B-Base --device-map --stages benchmark
     python reproduce.py --stages benchmark baselines     # skip the slow downstream eval
 
 NOTE: the default list is a cross-family spread, NOT the set the README tables
@@ -27,8 +27,10 @@ import time
 
 # Diverse, DENSE, ungated small (<=6 GB laptop) open models spanning FAMILIES --
 # cross-family results (different weight/outlier structure) are what make a quant
-# result credible, vs testing one vendor. Override with --models. Latest-tiny
-# alternative: Qwen/Qwen3.5-0.8B-Base (newest Qwen, but hybrid Gated-Delta/MoE arch).
+# result credible, vs testing one vendor. Override with --models. The dense small
+# Qwen below is Qwen3-0.6B-Base; the newest small Qwen (Qwen/Qwen3.5-0.8B, and the
+# Qwen3.6 series) are hybrid Gated-Delta/MoE, so verify the exact HF tag and
+# smoke-test before relying on them.
 DEFAULT_MODELS = [
     "HuggingFaceTB/SmolLM2-1.7B",   # HuggingFace (Apache, fully open)
     "Qwen/Qwen3-0.6B-Base",         # Alibaba Qwen (dense)

@@ -23,7 +23,12 @@ import torch.nn as nn
 from .linear import create_quantized_linear
 
 # Default precisions the profiler measures (besides the implicit lossless fp16).
-DEFAULT_PRECISIONS = ("int8", "int4", "int3")
+# int3 is intentionally excluded from the default — see the note in
+# ``allocator.allocate_optimal``: profiling it and handing it to the default
+# allocator makes the DP over-demote to 3-bit and lose. The one experiment that
+# studies the sub-4-bit tier (PAPER/exp/iso_memory.py) opts in with
+# ``SensitivityProfiler(precisions=("int8", "int4", "int3"))``.
+DEFAULT_PRECISIONS = ("int8", "int4")
 
 # Penalty assigned to a layer the profiler couldn't measure. Large and
 # quality-ordered so the allocator keeps such a layer at FP16 whenever the budget

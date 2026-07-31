@@ -12,7 +12,7 @@ import torch.nn as nn
 from typing import Any, Optional, Tuple
 from accelerate.hooks import ModelHook, add_hook_to_module
 
-from .linear import QuantizedLinear, QuantizedLinear4bit
+from .linear import QuantizedLinear, QuantizedLinear3bit, QuantizedLinear4bit
 
 
 def _move(obj: Any, device: torch.device) -> Any:
@@ -115,7 +115,7 @@ def estimate_model_memory(model: nn.Module) -> dict:
     dense_bytes = 0
 
     for _, module in model.named_modules():
-        if isinstance(module, (QuantizedLinear, QuantizedLinear4bit)):
+        if isinstance(module, (QuantizedLinear, QuantizedLinear3bit, QuantizedLinear4bit)):
             quantized_bytes += module.quantized_weights.memory_bytes()
             if module.bias is not None:
                 quantized_bytes += module.bias.numel() * module.bias.element_size()

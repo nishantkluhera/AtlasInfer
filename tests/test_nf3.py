@@ -146,7 +146,14 @@ class TestLayer:
 
 
 class TestAllocatorIntegration:
-    """The reason the tier exists."""
+    """The reason the tier exists.
+
+    int3 is an opt-in tier, not a library default (it loses in the default
+    allocator — see allocator.allocate_optimal), so these tests that exercise it
+    pass it explicitly, exactly as PAPER/exp/iso_memory.py does.
+    """
+
+    TIERS = ("fp16", "int8", "int4", "int3")
 
     def test_bytes_per_param_is_three_bits(self):
         assert BYTES_PER_PARAM["int3"] == 0.375
@@ -172,7 +179,7 @@ class TestAllocatorIntegration:
         uniform_int4 = sum(p.param_count for p in profiles.values()) * 0.5
         budget = int(uniform_int4 * 0.9)      # 10% BELOW uniform 4-bit
 
-        result = allocate_optimal(profiles, budget_bytes=budget)
+        result = allocate_optimal(profiles, budget_bytes=budget, precisions=self.TIERS)
         assert result.total_bytes <= budget, "allocator could not reach a sub-int4 budget"
         assert result.counts.get("int3", 0) > 0, "int3 tier was never used"
 
@@ -188,7 +195,7 @@ class TestAllocatorIntegration:
         """
         uniform = self._profiles()   # int3 error is a flat 3x int4 for every layer
         budget = int(sum(p.param_count for p in uniform.values()) * 0.5)
-        flat = allocate_optimal(uniform, budget_bytes=budget)
+        flat = allocate_optimal(uniform, budget_bytes=budget, precisions=self.TIERS)
         assert flat.counts.get("int4", 0) == len(uniform), (
             "with homogeneous sensitivity the optimum should stay uniform int4, "
             f"got {flat.counts}")
@@ -209,7 +216,7 @@ class TestAllocatorIntegration:
         profiles = {**robust, **fragile}
         budget = int(sum(p.param_count for p in profiles.values()) * 0.5)
 
-        result = allocate_optimal(profiles, budget_bytes=budget)
+        result = allocate_optimal(profiles, budget_bytes=budget, precisions=self.TIERS)
 
         assert result.total_bytes <= budget * 1.01
         assert result.counts.get("int3", 0) > 0, "no layer was demoted to 3-bit"
@@ -226,7 +233,7 @@ class TestAllocatorIntegration:
         budget = int(sum(p.param_count for p in profiles.values()) * 0.45)
         sens = {n: p.sensitivity("int4") for n, p in profiles.items()}
         sizes = {n: p.param_count for n, p in profiles.items()}
-        r = allocate_greedy(sens, sizes, budget, profiles=profiles)
+        r = allocate_greedy(sens, sizes, budget, profiles=profiles, precisions=self.TIERS)
         assert r.total_bytes <= budget
 
     def test_layers_without_an_int3_profile_are_never_assigned_int3(self):
@@ -244,9 +251,36 @@ class TestAllocatorIntegration:
         sizes = {n: p.param_count for n, p in profiles.items()}
         budget = int(10_000 * 0.5 * 2)
 
-        for result in (allocate_optimal(profiles, budget_bytes=budget),
-                       allocate_greedy(sens, sizes, budget, profiles=profiles)):
+        for result in (allocate_optimal(profiles, budget_bytes=budget, precisions=self.TIERS),
+                       allocate_greedy(sens, sizes, budget, profiles=profiles,
+                                       precisions=self.TIERS)):
             assert result.allocations["old"] != "int3"
+
+
+class TestPackageExports:
+    """Guards the top-level public API.
+
+    Regression: ``QuantizedLinear3bit`` was added to ``atlasinfer.__all__`` but
+    never imported into ``__init__``, so ``from atlasinfer import *`` raised
+    AttributeError and ``from atlasinfer import QuantizedLinear3bit`` raised
+    ImportError — while the whole suite stayed green because every test imports
+    from ``atlasinfer.linear`` directly.
+    """
+
+    def test_every_name_in_all_is_importable(self):
+        import atlasinfer
+        missing = [n for n in atlasinfer.__all__ if not hasattr(atlasinfer, n)]
+        assert not missing, f"__all__ names not importable from atlasinfer: {missing}"
+
+    def test_quantized_linear_3bit_is_a_top_level_export(self):
+        from atlasinfer import QuantizedLinear3bit
+        from atlasinfer.linear import QuantizedLinear3bit as FromLinear
+        assert QuantizedLinear3bit is FromLinear
+
+    def test_star_import_succeeds(self):
+        ns = {}
+        exec("from atlasinfer import *", ns)
+        assert "QuantizedLinear3bit" in ns
 
 
 if __name__ == "__main__":
